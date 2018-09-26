@@ -201,6 +201,7 @@ func NewVault(kmsConf KMSConfig) (KMS, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	// authenticate and get the access token
 	c.SetToken(accessToken)
 	v := vaultService{client: c, config: &config, leaseDuration: time.Duration(leaseDuration)}
