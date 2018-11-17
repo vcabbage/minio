@@ -34,6 +34,8 @@ const (
 	BackendFS
 	// Multi disk BackendErasure (single, distributed) backend.
 	BackendErasure
+	// SQLite backend.
+	BackendSQLite
 	// Add your own backend.
 )
 

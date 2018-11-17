@@ -110,6 +110,12 @@ func NewEndpoint(arg string) (ep Endpoint, e error) {
 	var isLocal bool
 	var host string
 	u, err := url.Parse(arg)
+	if u.Scheme == "sqlite" {
+		return Endpoint{
+			URL:     u,
+			IsLocal: true,
+		}, nil
+	}
 	if err == nil && u.Host != "" {
 		// URL style of endpoint.
 		// Valid URL style endpoint is

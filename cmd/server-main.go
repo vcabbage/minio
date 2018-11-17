@@ -395,12 +395,17 @@ func serverMain(ctx *cli.Context) {
 	handleSignals()
 }
 
+var NewSQLiteLayer func(uri string) (ObjectLayer, error)
+
 // Initialize object layer with the supplied disks, objectLayer is nil upon any error.
 func newObjectLayer(endpoints EndpointList) (newObject ObjectLayer, err error) {
 	// For FS only, directly use the disk.
 
 	isFS := len(endpoints) == 1
 	if isFS {
+		if endpoints[0].Scheme == "sqlite" {
+			return NewSQLiteLayer(endpoints[0].Path)
+		}
 		// Initialize new FS object layer.
 		return NewFSObjectLayer(endpoints[0].Path)
 	}
