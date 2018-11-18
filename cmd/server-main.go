@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -395,7 +396,7 @@ func serverMain(ctx *cli.Context) {
 	handleSignals()
 }
 
-var NewSQLiteLayer func(uri string) (ObjectLayer, error)
+var NewSQLiteLayer func(uri *url.URL) (ObjectLayer, error)
 
 // Initialize object layer with the supplied disks, objectLayer is nil upon any error.
 func newObjectLayer(endpoints EndpointList) (newObject ObjectLayer, err error) {
@@ -404,7 +405,7 @@ func newObjectLayer(endpoints EndpointList) (newObject ObjectLayer, err error) {
 	isFS := len(endpoints) == 1
 	if isFS {
 		if endpoints[0].Scheme == "sqlite" {
-			return NewSQLiteLayer(endpoints[0].Path)
+			return NewSQLiteLayer(endpoints[0].URL)
 		}
 		// Initialize new FS object layer.
 		return NewFSObjectLayer(endpoints[0].Path)

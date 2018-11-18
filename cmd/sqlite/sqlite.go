@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -20,6 +21,9 @@ import (
 	"github.com/minio/minio/pkg/policy"
 	"github.com/skyrings/skyring-common/tools/uuid"
 )
+
+// TODO: timestamps
+// TODO: etags
 
 const debugging = true
 
@@ -42,9 +46,12 @@ var (
 	errDBClosed = errors.New("db closed")
 )
 
-func NewSQLiteLayer(uri string) (minio.ObjectLayer, error) {
+func NewSQLiteLayer(uri *url.URL) (minio.ObjectLayer, error) {
+	if uri.Scheme == "sqlite" {
+		uri.Scheme = "file"
+	}
 	const poolSize = 10 // TODO: what size?
-	pool, err := sqlite.Open("temp_db.db", 0, poolSize)
+	pool, err := sqlite.Open(uri.String(), 0, poolSize)
 	if err != nil {
 		return nil, err
 	}
@@ -57,23 +64,25 @@ func NewSQLiteLayer(uri string) (minio.ObjectLayer, error) {
 	}
 
 	if debugging {
-		return debug.DebugLayer{s}, nil
+		return &debug.DebugLayer{Wrapped: s, LogCallers: 1}, nil
 	}
 
 	return s, nil
 }
 
+// timestamps are nanoseconds since unix epoch
 const sqlInit = `
 	CREATE TABLE IF NOT EXISTS buckets (
-		bucket TEXT PRIMARY KEY,
-		policy BLOB,
-		created DATETIME DEFAULT CURRENT_TIMESTAMP
+		bucket  TEXT PRIMARY KEY,
+		policy  BLOB,
+		created INTEGER
 	);
 	CREATE TABLE IF NOT EXISTS objects (
 		bucket   TEXT,
 		object   TEXT,
 		metadata TEXT,
 		data     BLOB,
+		modified INTEGER,
 		PRIMARY KEY (bucket, object)
 	);
 	CREATE TABLE IF NOT EXISTS uploads (
@@ -155,8 +164,9 @@ func (s *SQLite) MakeBucketWithLocation(ctx context.Context, bucket string, loca
 	}
 	defer s.pool.Put(conn)
 
-	stmt := conn.Prep("INSERT INTO buckets (bucket) VALUES (?);")
+	stmt := conn.Prep("INSERT INTO buckets (bucket, created) VALUES (?, ?);")
 	stmt.BindText(1, bucket)
+	stmt.BindInt64(2, time.Now().UnixNano())
 	_, err = stmt.Step()
 	return err
 }
@@ -184,7 +194,7 @@ func (s *SQLite) GetBucketInfo(ctx context.Context, bucket string) (minio.Bucket
 			panic("too many results for " + bucket) // TODO: error
 		}
 
-		bi.Created = time.Unix(stmt.GetInt64("created"), 0) // TODO: sub-second timestamps
+		bi.Created = time.Unix(0, stmt.GetInt64("created"))
 	}
 
 	if bi.Created.IsZero() {
@@ -200,7 +210,7 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error) {
 	}
 	defer s.pool.Put(conn)
 
-	stmt := conn.Prep("SELECT bucket from buckets;")
+	stmt := conn.Prep("SELECT bucket, created FROM buckets;")
 
 	var buckets []minio.BucketInfo
 	for {
@@ -212,8 +222,11 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error) {
 			break
 		}
 
+		// TODO: filter reserved/invalid bucket names
+
 		buckets = append(buckets, minio.BucketInfo{
-			Name: stmt.GetText("bucket"),
+			Name:    stmt.GetText("bucket"),
+			Created: time.Unix(0, stmt.GetInt64("created")),
 		})
 	}
 
@@ -251,18 +264,18 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 	// TODO: is "object > marker" adequate?
 	var stmt *sqlite.Stmt
 	if delimiter == "" {
-		stmt = conn.Prep("SELECT object as name, length(data) as size FROM objects WHERE bucket = ? AND object LIKE ? || '%' AND object > ? ORDER BY object LIMIT ?;")
+		stmt = conn.Prep("SELECT object as name, length(data) as size, modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' AND object > ? ORDER BY object LIMIT ?;")
 		stmt.BindText(1, bucket)
 		stmt.BindText(2, prefix)
 		stmt.BindText(3, marker)
 		stmt.BindInt64(4, int64(maxKeys)+1)
 	} else {
 		stmt = conn.Prep(`
-		SELECT DISTINCT $prefix || substr(ltrim(object, $prefix), 1, instr(ltrim(object, $prefix), $delimiter)) as name, 0 as size, 1 as is_prefix
+		SELECT DISTINCT $prefix || substr(ltrim(object, $prefix), 1, instr(ltrim(object, $prefix), $delimiter)) as name, 0 as size, 0 as modified, 1 as is_prefix
 		FROM objects
 		WHERE bucket = $bucket AND object LIKE $prefix || '%' AND object > $marker AND name <> $prefix
 		UNION
-		SELECT object as name, length(data) as size, 0 as is_prefix
+		SELECT object as name, length(data) as size, modified, 0 as is_prefix
 		FROM objects
 		WHERE bucket = $bucket AND object LIKE $prefix || '%' AND object > $marker AND instr(ltrim(object, $prefix), $delimiter) = 0
 		ORDER BY object
@@ -294,6 +307,7 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 		var (
 			name     = stmt.GetText("name")
 			size     = stmt.GetInt64("size")
+			modified = time.Unix(0, stmt.GetInt64("modified"))
 			isPrefix = stmt.GetInt64("is_prefix") == 1
 		)
 		objects.NextMarker = name
@@ -302,17 +316,33 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 			continue
 		}
 		objects.Objects = append(objects.Objects, minio.ObjectInfo{
-			Bucket: bucket,
-			Name:   name,
-			Size:   size,
+			Bucket:  bucket,
+			Name:    name,
+			Size:    size,
+			ModTime: modified,
 		})
 	}
 
 	return objects, nil
 }
 func (s *SQLite) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (minio.ListObjectsV2Info, error) {
-	// TODO: implement
-	return minio.ListObjectsV2Info{}, nil
+	marker := continuationToken
+	if marker == "" {
+		marker = startAfter
+	}
+
+	v1, err := s.ListObjects(ctx, bucket, prefix, marker, delimiter, maxKeys)
+	if err != nil {
+		return minio.ListObjectsV2Info{}, err
+	}
+
+	return minio.ListObjectsV2Info{
+		IsTruncated:           v1.IsTruncated,
+		ContinuationToken:     continuationToken,
+		NextContinuationToken: v1.NextMarker,
+		Objects:               v1.Objects,
+		Prefixes:              v1.Prefixes,
+	}, err
 }
 
 // Object operations.
@@ -335,13 +365,14 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		}
 	}()
 
-	stmt := conn.Prep("SELECT rowid, object FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
+	stmt := conn.Prep("SELECT rowid, object, modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 
 	var (
-		rowID int64
-		name  string
+		rowID    int64
+		name     string
+		modified time.Time
 	)
 	for {
 		hasRow, err := stmt.Step()
@@ -354,6 +385,7 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 
 		rowID = stmt.GetInt64("rowid")
 		name = stmt.GetText("object")
+		modified = time.Unix(0, stmt.GetInt64("modified"))
 	}
 
 	switch {
@@ -365,9 +397,10 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		}
 
 		info := minio.ObjectInfo{
-			Bucket: bucket,
-			Name:   object,
-			Size:   blob.Size(),
+			Bucket:  bucket,
+			Name:    object,
+			Size:    blob.Size(),
+			ModTime: modified,
 		}
 
 		startOffset, length, err := rs.GetOffsetLength(info.Size)
@@ -452,13 +485,14 @@ func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts 
 	}
 	defer s.pool.Put(conn)
 
-	stmt := conn.Prep("SELECT object, length(data) FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
+	stmt := conn.Prep("SELECT object, length(data), modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 
 	var (
-		name string
-		size int64
+		name     string
+		size     int64
+		modified time.Time
 	)
 	for {
 		hasRow, err := stmt.Step()
@@ -471,15 +505,17 @@ func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts 
 
 		name = stmt.ColumnText(0)
 		size = stmt.ColumnInt64(1)
+		modified = time.Unix(0, stmt.ColumnInt64(2))
 	}
 
 	switch {
 	// object
 	case name == object:
 		return minio.ObjectInfo{
-			Bucket: bucket,
-			Name:   object,
-			Size:   size,
+			Bucket:  bucket,
+			Name:    object,
+			Size:    size,
+			ModTime: modified,
 		}, nil
 
 	// directory
@@ -513,12 +549,13 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *min
 
 	// TODO: check if bucket exists?
 	stmt := conn.Prep(`
-		INSERT INTO objects (bucket, object, data, metadata) VALUES (?, ?, ?, ?)
-		ON CONFLICT (bucket, object) DO UPDATE SET data=excluded.data, metadata=excluded.metadata;`)
+		INSERT INTO objects (bucket, object, data, metadata, modified) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (bucket, object) DO UPDATE SET data=excluded.data, metadata=excluded.metadata, modified=excluded.modified;`)
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 	stmt.BindZeroBlob(3, data.Size())
 	stmt.BindBytes(4, mdJSON)
+	stmt.BindInt64(5, time.Now().UnixNano())
 	_, err = stmt.Step()
 	if err != nil {
 		return minio.ObjectInfo{}, err
@@ -550,8 +587,31 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *min
 	}, nil
 }
 func (s *SQLite) CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (minio.ObjectInfo, error) {
-	// TODO: implement
-	return minio.ObjectInfo{}, nil
+	// TODO: metadata only update
+
+	conn, err := s.getConn(ctx)
+	if err != nil {
+		return minio.ObjectInfo{}, err
+	}
+	defer s.pool.Put(conn)
+
+	stmt := conn.Prep(`
+	INSERT INTO objects SELECT ?, ?, metadata, data, ? FROM objects WHERE bucket = ? AND object = ?
+	ON CONFLICT (bucket, object) DO UPDATE SET metadata = excluded.metadata, data = excluded.data, modified = excluded.modified;`)
+	stmt.BindText(1, destBucket)
+	stmt.BindText(2, destObject)
+	stmt.BindInt64(3, time.Now().UnixNano())
+	stmt.BindText(4, srcBucket)
+	stmt.BindText(5, srcObject)
+	_, err = stmt.Step()
+	if err != nil {
+		return minio.ObjectInfo{}, err
+	}
+
+	return minio.ObjectInfo{
+		Bucket: destBucket,
+		Name:   destObject,
+	}, nil
 }
 func (s *SQLite) DeleteObject(ctx context.Context, bucket, object string) error {
 	conn, err := s.getConn(ctx)
@@ -590,8 +650,83 @@ func mustGetUUID() string {
 
 // Multipart operations.
 func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (minio.ListMultipartsInfo, error) {
-	// TODO: implement
-	return minio.ListMultipartsInfo{}, nil
+	res := minio.ListMultipartsInfo{
+		KeyMarker:      keyMarker,
+		UploadIDMarker: uploadIDMarker,
+		MaxUploads:     maxUploads,
+		Prefix:         prefix,
+		Delimiter:      delimiter,
+		// EncodingType
+	}
+
+	conn, err := s.getConn(ctx)
+	if err != nil {
+		return res, nil
+	}
+	defer s.pool.Put(conn)
+
+	var stmt *sqlite.Stmt
+	if delimiter == "" {
+		stmt = conn.Prep("SELECT id, object as name FROM uploads WHERE bucket = ? AND object LIKE ? || '%' AND object > ? AND id > ? ORDER BY object LIMIT ?;")
+		stmt.BindText(1, bucket)
+		stmt.BindText(2, prefix)
+		stmt.BindText(3, keyMarker)
+		stmt.BindText(4, uploadIDMarker)
+		stmt.BindInt64(5, int64(maxUploads)+1)
+	} else {
+		stmt = conn.Prep(`
+		SELECT DISTINCT id, $prefix || substr(ltrim(object, $prefix), 1, instr(ltrim(object, $prefix), $delimiter)) as name, 1 as is_prefix
+		FROM uploads
+		WHERE bucket = $bucket AND object LIKE $prefix || '%' AND object > $key_marker AND id > $id_marker AND name <> $prefix
+		UNION
+		SELECT id, object as name, 0 as is_prefix
+		FROM uploads
+		WHERE bucket = $bucket AND object LIKE $prefix || '%' AND object > $key_marker AND id > $id_marker AND instr(ltrim(object, $prefix), $delimiter) = 0
+		ORDER BY object
+		LIMIT $max_keys;`)
+		stmt.SetText("$bucket", bucket)
+		stmt.SetText("$prefix", prefix)
+		stmt.SetText("$key_marker", keyMarker)
+		stmt.SetText("$id_marker", uploadIDMarker)
+		stmt.SetText("$delimiter", delimiter)
+		stmt.SetInt64("$max_keys", int64(maxUploads)+1)
+	}
+
+	var count int
+	for {
+		hasRow, err := stmt.Step()
+		if err != nil {
+			return res, err
+		}
+		if !hasRow {
+			break
+		}
+
+		count++
+		if count > maxUploads {
+			res.IsTruncated = true
+			continue
+		}
+
+		var (
+			id       = stmt.GetText("id")
+			name     = stmt.GetText("name")
+			isPrefix = stmt.GetInt64("is_prefix") == 1
+		)
+		res.NextKeyMarker = name
+		res.NextUploadIDMarker = id
+		if isPrefix {
+			res.CommonPrefixes = append(res.CommonPrefixes, name)
+			continue
+		}
+		res.Uploads = append(res.Uploads, minio.MultipartInfo{
+			Object:   name,
+			UploadID: id,
+			// TODO: Initiated
+		})
+	}
+
+	return res, nil
 }
 func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, metadata map[string]string, opts minio.ObjectOptions) (string, error) {
 	id := mustGetUUID()
@@ -622,12 +757,14 @@ func (s *SQLite) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destB
 	// TODO: implement
 	return minio.PartInfo{}, nil
 }
-func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *minio.PutObjReader, opts minio.ObjectOptions) (minio.PartInfo, error) {
+func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *minio.PutObjReader, opts minio.ObjectOptions) (_ minio.PartInfo, err error) {
 	conn, err := s.getConn(ctx)
 	if err != nil {
 		return minio.PartInfo{}, err
 	}
 	defer s.pool.Put(conn)
+
+	sqliteutil.Save(conn)(&err)
 
 	stmt := conn.Prep("INSERT INTO parts (upload_id, part_id, data) VALUES (?, ?, ?)")
 	stmt.BindText(1, uploadID) // TODO: validate
@@ -652,8 +789,57 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 	return minio.PartInfo{PartNumber: partID}, nil
 }
 func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int) (minio.ListPartsInfo, error) {
-	// TODO: implement
-	return minio.ListPartsInfo{}, nil
+	res := minio.ListPartsInfo{
+		Bucket:           bucket,
+		Object:           object,
+		UploadID:         uploadID,
+		PartNumberMarker: partNumberMarker,
+		MaxParts:         maxParts,
+		// UserDefined
+		// EncodingType
+	}
+
+	conn, err := s.getConn(ctx)
+	if err != nil {
+		return res, err
+	}
+	defer s.pool.Put(conn)
+
+	// TODO: validate upload exists
+
+	stmt := conn.Prep("SELECT part_id, length(data) FROM parts WHERE upload_id = ? ORDER BY part_id LIMIT ?;")
+	stmt.BindText(1, uploadID)
+	stmt.BindInt64(2, int64(maxParts)+1)
+
+	var count int
+	for {
+		hasRow, err := stmt.Step()
+		if err != nil {
+			return res, err
+		}
+		if !hasRow {
+			break
+		}
+
+		count++
+		if count > maxParts {
+			res.IsTruncated = true
+			continue
+		}
+
+		var (
+			partID = stmt.ColumnInt(0)
+			size   = stmt.ColumnInt64(1)
+		)
+
+		res.NextPartNumberMarker = partID
+		res.Parts = append(res.Parts, minio.PartInfo{
+			PartNumber: partID,
+			Size:       size,
+		})
+	}
+
+	return res, nil
 }
 func (s *SQLite) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) error {
 	conn, err := s.getConn(ctx)
@@ -712,12 +898,13 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	// create object
 	// TODO: check if bucket exists?
 	stmt := conn.Prep(`
-		INSERT INTO objects (bucket, object, data, metadata) VALUES (?, ?, ?, (SELECT metadata FROM uploads WHERE id = ?))
+		INSERT INTO objects (bucket, object, data, metadata, modified) VALUES (?, ?, ?, (SELECT metadata FROM uploads WHERE id = ?), ?)
 		ON CONFLICT (bucket, object) DO UPDATE SET data=excluded.data, metadata=excluded.metadata;`)
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 	stmt.BindZeroBlob(3, size)
 	stmt.BindText(4, uploadID)
+	stmt.BindInt64(5, time.Now().UnixNano())
 	_, err = stmt.Step()
 	if err != nil {
 		return minio.ObjectInfo{}, err
@@ -770,34 +957,27 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	return minio.ObjectInfo{
 		Bucket: bucket,
 		Name:   object,
-		Size:   size,
 	}, nil
 }
 
 // Healing operations.
 func (s *SQLite) ReloadFormat(ctx context.Context, dryRun bool) error {
-	// TODO: implement
-	return nil
+	return minio.NotImplemented{}
 }
 func (s *SQLite) HealFormat(ctx context.Context, dryRun bool) (madmin.HealResultItem, error) {
-	// TODO: implement
-	return madmin.HealResultItem{}, nil
+	return madmin.HealResultItem{}, minio.NotImplemented{}
 }
 func (s *SQLite) HealBucket(ctx context.Context, bucket string, dryRun bool) ([]madmin.HealResultItem, error) {
-	// TODO: implement
-	return nil, nil
+	return nil, minio.NotImplemented{}
 }
 func (s *SQLite) HealObject(ctx context.Context, bucket, object string, dryRun bool) (madmin.HealResultItem, error) {
-	// TODO: implement
-	return madmin.HealResultItem{}, nil
+	return madmin.HealResultItem{}, minio.NotImplemented{}
 }
 func (s *SQLite) ListBucketsHeal(ctx context.Context) ([]minio.BucketInfo, error) {
-	// TODO: implement
-	return nil, nil
+	return nil, minio.NotImplemented{}
 }
 func (s *SQLite) ListObjectsHeal(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (minio.ListObjectsInfo, error) {
-	// TODO: implement
-	return minio.ListObjectsInfo{}, nil
+	return minio.ListObjectsInfo{}, minio.NotImplemented{}
 }
 
 // Policy operations
