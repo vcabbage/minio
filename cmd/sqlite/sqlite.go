@@ -79,9 +79,14 @@ const sqlInit = `
 		bucket   TEXT,
 		object   TEXT,
 		metadata TEXT,
-		data     BLOB,
+		size     INTEGER,
+		blob_id  INTEGER,
 		modified INTEGER,
 		PRIMARY KEY (bucket, object)
+	) WITHOUT ROWID;
+	CREATE TABLE IF NOT EXISTS blobs (
+		id   INTEGER PRIMARY KEY,
+		data BLOB
 	);
 	CREATE TABLE IF NOT EXISTS uploads (
 		id       TEXT PRIMARY KEY,
@@ -299,7 +304,7 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 	// TODO: is "object > marker" adequate?
 	var stmt *sqlite.Stmt
 	if delimiter == "" {
-		stmt = conn.Prep("SELECT object as name, length(data) as size, modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' AND object > ? ORDER BY object LIMIT ?;")
+		stmt = conn.Prep("SELECT object as name, size, modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' AND object > ? ORDER BY object LIMIT ?;")
 		stmt.BindText(1, bucket)
 		stmt.BindText(2, prefix)
 		stmt.BindText(3, marker)
@@ -310,7 +315,7 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 		FROM objects
 		WHERE bucket = $bucket AND object LIKE $prefix || '%' AND object > $marker AND name <> $prefix
 		UNION
-		SELECT object as name, length(data) as size, modified, 0 as is_prefix
+		SELECT object as name, size, modified, 0 as is_prefix
 		FROM objects
 		WHERE bucket = $bucket AND object LIKE $prefix || '%' AND object > $marker AND instr(ltrim(object, $prefix), $delimiter) = 0
 		ORDER BY object
@@ -416,7 +421,7 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		}
 	}()
 
-	stmt := conn.Prep("SELECT rowid, object, modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
+	stmt := conn.Prep("SELECT object, blob_id, modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 
@@ -434,15 +439,15 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 			break
 		}
 
-		rowID = stmt.ColumnInt64(0)
-		name = stmt.ColumnText(1)
+		name = stmt.ColumnText(0)
+		rowID = stmt.ColumnInt64(1)
 		modified = columnTime(stmt, 2)
 	}
 
 	switch {
 	// object
 	case name == object:
-		blob, err := conn.OpenBlob("", "objects", "data", rowID, false)
+		blob, err := conn.OpenBlob("", "blobs", "data", rowID, false)
 		if err != nil {
 			return nil, err
 		}
@@ -501,7 +506,7 @@ func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffs
 		return err
 	}
 
-	blob, err := conn.OpenBlob("", "objects", "data", rowID, false)
+	blob, err := conn.OpenBlob("", "objects", "blobs", rowID, false)
 	if err != nil {
 		return err
 	}
@@ -522,7 +527,7 @@ func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts 
 	}
 	defer s.pool.Put(conn)
 
-	stmt := conn.Prep("SELECT object, length(data), modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
+	stmt := conn.Prep("SELECT object, size, modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 
@@ -584,13 +589,15 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *min
 
 	defer sqliteutil.Save(conn)(&err)
 
+	stmt := conn.Prep("INSERT INTO blobs (data) VALUES (?);")
+
 	// TODO: check if bucket exists?
 	stmt := conn.Prep(`
-		INSERT INTO objects (bucket, object, data, metadata, modified) VALUES (?, ?, ?, ?, ?)
+		INSERT INTO objects (bucket, object, size, metadata, modified) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT (bucket, object) DO UPDATE SET data=excluded.data, metadata=excluded.metadata, modified=excluded.modified;`)
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
-	stmt.BindZeroBlob(3, data.Size())
+	stmt.BindInt64(3, data.Size())
 	stmt.BindBytes(4, mdJSON)
 	stmt.BindInt64(5, time.Now().UnixNano())
 	_, err = stmt.Step()
@@ -1174,7 +1181,7 @@ func lastObjectUpsertRowID(conn *sqlite.Conn, bucket, object string) (int64, err
 }
 
 func getObjectRowID(conn *sqlite.Conn, bucket, object string) (int64, error) {
-	stmt := conn.Prep("SELECT rowid FROM objects WHERE bucket = ? AND object = ?;")
+	stmt := conn.Prep("SELECT blob_id FROM objects WHERE bucket = ? AND object = ?;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 
@@ -1191,7 +1198,7 @@ func getObjectRowID(conn *sqlite.Conn, bucket, object string) (int64, error) {
 			panic("too many results for " + bucket + "/" + object) // TODO: error
 		}
 
-		rowID = stmt.GetInt64("rowid")
+		rowID = stmt.ColumnInt64(0)
 	}
 
 	if rowID == -1 {
