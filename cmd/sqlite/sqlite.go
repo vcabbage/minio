@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"crawshaw.io/sqlite"
-	"crawshaw.io/sqlite/sqliteutil"
+	"crawshaw.io/sqlite/sqlitex"
 	minio "github.com/minio/minio/cmd"
 	"github.com/minio/minio/cmd/debug"
 	"github.com/minio/minio/cmd/logger"
@@ -22,6 +22,9 @@ import (
 	"github.com/minio/minio/pkg/policy"
 	"github.com/skyrings/skyring-common/tools/uuid"
 )
+
+// TODO: default sqlite limits BLOBs to ~1GB (base-10) and has a hard limit of 2GB.
+//       work around this by storing multiple blobs for objects above the limit.
 
 // TODO: etags
 // TODO: parse metadata
@@ -37,7 +40,7 @@ func init() {
 }
 
 type SQLite struct {
-	pool   *sqlite.Pool
+	pool   *sqlitex.Pool
 	closed uint32
 }
 
@@ -50,7 +53,7 @@ func NewSQLiteLayer(uri *url.URL) (minio.ObjectLayer, error) {
 		uri.Scheme = "file"
 	}
 	const poolSize = 100 // TODO: what size?
-	pool, err := sqlite.Open(uri.String(), 0, poolSize)
+	pool, err := sqlitex.Open(uri.String(), 0, poolSize)
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +67,7 @@ func NewSQLiteLayer(uri *url.URL) (minio.ObjectLayer, error) {
 		return nil, err
 	}
 
-	return s, nil
+	// return s, nil
 	return &debug.DebugLayer{Wrapped: s, LogCallers: 1}, nil
 }
 
@@ -75,19 +78,19 @@ const sqlInit = `
 		policy  BLOB,
 		created INTEGER
 	);
+	CREATE TABLE IF NOT EXISTS blobs (
+		id   INTEGER PRIMARY KEY,
+		data BLOB
+	);
 	CREATE TABLE IF NOT EXISTS objects (
 		bucket   TEXT,
 		object   TEXT,
 		metadata TEXT,
 		size     INTEGER,
-		blob_id  INTEGER,
 		modified INTEGER,
+		blob_id  INTEGER REFERENCES blobs(id) ON DELETE RESTRICT,
 		PRIMARY KEY (bucket, object)
 	) WITHOUT ROWID;
-	CREATE TABLE IF NOT EXISTS blobs (
-		id   INTEGER PRIMARY KEY,
-		data BLOB
-	);
 	CREATE TABLE IF NOT EXISTS uploads (
 		id       TEXT PRIMARY KEY,
 		bucket   TEXT,
@@ -99,7 +102,15 @@ const sqlInit = `
 		part_id   INTEGER,
 		data      BLOB,
 		PRIMARY KEY (upload_id, part_id)
-	);`
+	);
+	CREATE TRIGGER IF NOT EXISTS remove_object AFTER DELETE ON objects
+	BEGIN
+		DELETE FROM blobs WHERE id = OLD.blob_id AND NOT EXISTS (SELECT 1 FROM objects WHERE blob_id = OLD.blob_id);
+	END;
+	CREATE TRIGGER IF NOT EXISTS update_object AFTER UPDATE OF blob_id ON objects
+	BEGIN
+		DELETE FROM blobs WHERE id = OLD.blob_id AND NOT EXISTS (SELECT 1 FROM objects WHERE blob_id = OLD.blob_id);
+	END;`
 
 func columnTime(stmt *sqlite.Stmt, col int) time.Time {
 	return time.Unix(0, stmt.ColumnInt64(col))
@@ -114,7 +125,7 @@ func (s *SQLite) init() error {
 	}
 	defer s.pool.Put(conn)
 
-	err = sqliteutil.ExecScript(conn, sqlInit)
+	err = sqlitex.ExecScript(conn, sqlInit)
 	if err != nil {
 		return err
 	}
@@ -149,11 +160,11 @@ func (s *SQLite) dbSize(ctx context.Context) (int64, error) {
 	}
 	defer s.pool.Put(conn)
 
-	return sqliteutil.ResultInt64(conn.Prep("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size();"))
+	return sqlitex.ResultInt64(conn.Prep("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size();"))
 }
 
 func (s *SQLite) getConn(ctx context.Context) (*sqlite.Conn, error) {
-	conn := s.pool.Get(ctx.Done())
+	conn := s.pool.Get(ctx)
 	if conn == nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -163,6 +174,12 @@ func (s *SQLite) getConn(ctx context.Context) (*sqlite.Conn, error) {
 	// Set very long busy timeout. The context done channel passed when getting
 	// the connection from the pool should always apply.
 	conn.SetBusyTimeout(5 * time.Minute)
+
+	err := sqlitex.ExecTransient(conn, "PRAGMA foreign_keys = ON;", nil)
+	if err != nil {
+		return nil, err
+	}
+
 	return conn, nil
 }
 
@@ -279,7 +296,7 @@ func (s *SQLite) DeleteBucket(ctx context.Context, bucket string) (err error) {
 	}
 	defer s.pool.Put(conn)
 
-	defer sqliteutil.Save(conn)(&err)
+	defer sqlitex.Save(conn)(&err)
 
 	stmt := conn.Prep("DELETE FROM buckets WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
@@ -506,7 +523,7 @@ func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffs
 		return err
 	}
 
-	blob, err := conn.OpenBlob("", "objects", "blobs", rowID, false)
+	blob, err := conn.OpenBlob("", "blobs", "data", rowID, false)
 	if err != nil {
 		return err
 	}
@@ -587,40 +604,39 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *min
 	}
 	defer s.pool.Put(conn)
 
-	defer sqliteutil.Save(conn)(&err)
+	defer sqlitex.Save(conn)(&err)
 
 	stmt := conn.Prep("INSERT INTO blobs (data) VALUES (?);")
-
-	// TODO: check if bucket exists?
-	stmt := conn.Prep(`
-		INSERT INTO objects (bucket, object, size, metadata, modified) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT (bucket, object) DO UPDATE SET data=excluded.data, metadata=excluded.metadata, modified=excluded.modified;`)
-	stmt.BindText(1, bucket)
-	stmt.BindText(2, object)
-	stmt.BindInt64(3, data.Size())
-	stmt.BindBytes(4, mdJSON)
-	stmt.BindInt64(5, time.Now().UnixNano())
+	stmt.BindZeroBlob(1, data.Size())
 	_, err = stmt.Step()
 	if err != nil {
 		return minio.ObjectInfo{}, err
 	}
 
 	rowID := conn.LastInsertRowID()
-	if rowID < 1 {
-		// No last insert on upsert
-		rowID, err = getObjectRowID(conn, bucket, object)
-		if err != nil {
-			return minio.ObjectInfo{}, err
-		}
-	}
-
-	blob, err := conn.OpenBlob("", "objects", "data", rowID, true)
+	blob, err := conn.OpenBlob("", "blobs", "data", rowID, true)
 	if err != nil {
 		return minio.ObjectInfo{}, err
 	}
-	defer blob.Close()
 
 	_, err = io.Copy(blob, data)
+	blob.Close()
+	if err != nil {
+		return minio.ObjectInfo{}, err
+	}
+
+	// TODO: check if bucket exists?
+	// TODO: handle removal of previous blob
+	stmt = conn.Prep(`
+		INSERT INTO objects (bucket, object, size, metadata, modified, blob_id) VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (bucket, object) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, modified=excluded.modified, blob_id=excluded.blob_id;`)
+	stmt.BindText(1, bucket)
+	stmt.BindText(2, object)
+	stmt.BindInt64(3, data.Size())
+	stmt.BindBytes(4, mdJSON)
+	stmt.BindInt64(5, time.Now().UnixNano())
+	stmt.BindInt64(6, rowID)
+	_, err = stmt.Step()
 	if err != nil {
 		return minio.ObjectInfo{}, err
 	}
@@ -640,8 +656,9 @@ func (s *SQLite) CopyObject(ctx context.Context, srcBucket, srcObject, destBucke
 	defer s.pool.Put(conn)
 
 	stmt := conn.Prep(`
-	INSERT INTO objects SELECT ?, ?, metadata, data, ? FROM objects WHERE bucket = ? AND object = ?
-	ON CONFLICT (bucket, object) DO UPDATE SET metadata = excluded.metadata, data = excluded.data, modified = excluded.modified;`)
+	INSERT INTO objects(bucket, object, metadata, size, blob_id, modified)
+	SELECT ?, ?, metadata, size, blob_id, ? FROM objects WHERE bucket = ? AND object = ?
+	ON CONFLICT (bucket, object) DO UPDATE SET metadata = excluded.metadata, size = excluded.size, blob_id = excluded.blob_id, modified = excluded.modified;`)
 	stmt.BindText(1, destBucket)
 	stmt.BindText(2, destObject)
 	stmt.BindInt64(3, time.Now().UnixNano())
@@ -664,7 +681,7 @@ func (s *SQLite) DeleteObject(ctx context.Context, bucket, object string) (err e
 	}
 	defer s.pool.Put(conn)
 
-	sqliteutil.Save(conn)(&err)
+	sqlitex.Save(conn)(&err)
 
 	err = bucketExists(conn, bucket)
 	if err != nil {
@@ -716,7 +733,7 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 	}
 	defer s.pool.Put(conn)
 
-	sqliteutil.Save(conn)(&err)
+	sqlitex.Save(conn)(&err)
 
 	err = bucketExists(conn, bucket)
 	if err != nil {
@@ -790,7 +807,7 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 func bucketExists(conn *sqlite.Conn, bucket string) error {
 	stmt := conn.Prep("SELECT count(*) FROM buckets WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
-	count, err := sqliteutil.ResultInt64(stmt)
+	count, err := sqlitex.ResultInt64(stmt)
 	if err != nil {
 		return toMinioError(err, errSourceBuckets, bucket)
 	}
@@ -813,7 +830,7 @@ func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, 
 	}
 	defer s.pool.Put(conn)
 
-	sqliteutil.Save(conn)(&err)
+	sqlitex.Save(conn)(&err)
 
 	err = bucketExists(conn, bucket)
 	if err != nil {
@@ -841,7 +858,7 @@ func uploadExists(conn *sqlite.Conn, bucket, object, uploadID string) error {
 	stmt.BindText(1, uploadID)
 	stmt.BindText(2, bucket)
 	stmt.BindText(3, object)
-	count, err := sqliteutil.ResultInt64(stmt)
+	count, err := sqlitex.ResultInt64(stmt)
 	if err != nil {
 		return toMinioError(err, errSourceUploads, uploadID)
 	}
@@ -858,7 +875,7 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 	}
 	defer s.pool.Put(conn)
 
-	sqliteutil.Save(conn)(&err)
+	sqlitex.Save(conn)(&err)
 
 	err = uploadExists(conn, bucket, object, uploadID)
 	if err != nil {
@@ -976,7 +993,7 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	}
 	defer s.pool.Put(conn)
 
-	defer sqliteutil.Save(conn)(&err)
+	defer sqlitex.Save(conn)(&err)
 
 	// determine complete size
 	var (
@@ -1002,30 +1019,17 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 		}
 	}
 
-	// create object
-	// TODO: check if bucket exists?
-	stmt := conn.Prep(`
-		INSERT INTO objects (bucket, object, data, metadata, modified) VALUES (?, ?, ?, (SELECT metadata FROM uploads WHERE id = ?), ?)
-		ON CONFLICT (bucket, object) DO UPDATE SET data=excluded.data, metadata=excluded.metadata;`)
-	stmt.BindText(1, bucket)
-	stmt.BindText(2, object)
-	stmt.BindZeroBlob(3, size)
-	stmt.BindText(4, uploadID)
-	stmt.BindInt64(5, time.Now().UnixNano())
+	stmt := conn.Prep("INSERT INTO blobs (data) VALUES (?);")
+	stmt.BindZeroBlob(1, size)
 	_, err = stmt.Step()
-	if err != nil {
-		return minio.ObjectInfo{}, toMinioError(err, errSourceObjects, object)
-	}
-
-	rowID, err := lastObjectUpsertRowID(conn, bucket, object)
 	if err != nil {
 		return minio.ObjectInfo{}, err
 	}
 
-	// open object blob
-	objBlob, err := conn.OpenBlob("", "objects", "data", rowID, true)
+	rowID := conn.LastInsertRowID()
+	objBlob, err := conn.OpenBlob("", "blobs", "data", rowID, true)
 	if err != nil {
-		return minio.ObjectInfo{}, toMinioError(err, errSourceObjects, object)
+		return minio.ObjectInfo{}, err
 	}
 	defer objBlob.Close()
 
@@ -1041,6 +1045,22 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 		if err != nil {
 			return minio.ObjectInfo{}, toMinioError(err, errSourceParts, uploadID)
 		}
+	}
+
+	// create object
+	// TODO: check if bucket exists?
+	stmt = conn.Prep(`
+		INSERT INTO objects (bucket, object, size, metadata, modified, blob_id) VALUES (?, ?, ?, (SELECT metadata FROM uploads WHERE id = ?), ?, ?)
+		ON CONFLICT (bucket, object) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, modified=excluded.modified, blob_id=excluded.blob_id;`)
+	stmt.BindText(1, bucket)
+	stmt.BindText(2, object)
+	stmt.BindZeroBlob(3, size)
+	stmt.BindText(4, uploadID)
+	stmt.BindInt64(5, time.Now().UnixNano())
+	stmt.BindInt64(6, rowID)
+	_, err = stmt.Step()
+	if err != nil {
+		return minio.ObjectInfo{}, toMinioError(err, errSourceObjects, object)
 	}
 
 	// remove upload
