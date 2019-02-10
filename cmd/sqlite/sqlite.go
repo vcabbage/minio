@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -23,16 +22,11 @@ import (
 	"github.com/skyrings/skyring-common/tools/uuid"
 )
 
-// TODO: default sqlite limits BLOBs to ~1GB (base-10) and has a hard limit of 2GB.
-//       work around this by storing multiple blobs for objects above the limit.
-
 // TODO: etags
 // TODO: parse metadata
 
 // TODO: copied
-const (
-	minioMetaBucket = ".minio.sys"
-)
+const minioMetaBucket = ".minio.sys"
 
 func init() {
 	// TODO: remove awful hack
@@ -68,40 +62,41 @@ func NewSQLiteLayer(uri *url.URL) (minio.ObjectLayer, error) {
 	}
 
 	return s, nil
-	return &debug.DebugLayer{Wrapped: s, LogCallers: 1}, nil
+	return &debug.DebugLayer{Wrapped: s, LogReturns: false, LogCallers: 1}, nil
 }
+
+// Multipart uploads are maintained as individual parts to avoid
+// the overhead of recombining on completion. This also allows objects
+// larger than SQLITE_MAX_LENGTH to be stored.
 
 // timestamps are nanoseconds since unix epoch
 const sqlInit = `
 	CREATE TABLE IF NOT EXISTS buckets (
-		bucket  TEXT PRIMARY KEY,
+		bucket  TEXT PRIMARY KEY NOT NULL,
 		policy  BLOB,
-		created INTEGER
+		created INTEGER NOT NULL
 	);
 	CREATE TABLE IF NOT EXISTS blobs (
-		id   INTEGER PRIMARY KEY,
-		data BLOB
+		id      INTEGER NOT NULL,
+		part_id INTEGER NOT NULL DEFAULT 0,
+		data    BLOB NOT NULL,
+		PRIMARY KEY (id, part_id)
 	);
 	CREATE TABLE IF NOT EXISTS objects (
 		bucket   TEXT REFERENCES buckets ON DELETE CASCADE ON UPDATE CASCADE,
-		object   TEXT,
+		object   TEXT NOT NULL,
 		metadata TEXT,
-		size     INTEGER,
-		modified INTEGER,
-		blob_id  INTEGER REFERENCES blobs ON DELETE RESTRICT,
+		size     INTEGER NOT NULL,
+		modified INTEGER NOT NULL,
+		blob_id  INTEGER NOT NULL,
 		PRIMARY KEY (bucket, object)
 	) WITHOUT ROWID;
 	CREATE TABLE IF NOT EXISTS uploads (
-		id       TEXT PRIMARY KEY,
-		bucket   TEXT,
-		object   TEXT,
-		metadata TEXT
-	);
-	CREATE TABLE IF NOT EXISTS parts (
-		upload_id TEXT REFERENCES uploads ON DELETE CASCADE,
-		part_id   INTEGER,
-		data      BLOB,
-		PRIMARY KEY (upload_id, part_id)
+		id       TEXT PRIMARY KEY NOT NULL,
+		bucket   TEXT REFERENCES buckets ON DELETE CASCADE ON UPDATE CASCADE,
+		object   TEXT NOT NULL,
+		metadata TEXT,
+		blob_id  INTEGER NOT NULL
 	);
 	CREATE TRIGGER IF NOT EXISTS remove_object AFTER DELETE ON objects
 	BEGIN
@@ -130,6 +125,7 @@ func (s *SQLite) init() error {
 		return err
 	}
 
+	// TODO: is this necessary?
 	_, err = s.GetBucketInfo(ctx, minioMetaBucket)
 	if err == nil {
 		return nil
@@ -201,6 +197,8 @@ func toMinioError(err error, source int, srcLabel string) error {
 			switch source {
 			case errSourceBuckets:
 				return minio.BucketExists{Bucket: srcLabel}
+			case errSourceObjects:
+				return minio.ObjectNotFound{Object: srcLabel} // TODO: include bucket
 			}
 		case sqlite.SQLITE_FULL:
 			return minio.StorageFull{}
@@ -395,21 +393,6 @@ func (s *SQLite) ListObjectsV2(ctx context.Context, bucket, prefix, continuation
 	}, err
 }
 
-func blobReader(blob *sqlite.Blob, startOffset, length int64) (io.Reader, error) {
-	if startOffset != 0 {
-		_, err := blob.Seek(startOffset, io.SeekStart)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if length > -1 {
-		// TODO: check startOffset+length>blob.Size()?
-		return io.LimitReader(blob, length), nil
-	}
-	return blob, nil
-}
-
 // Object operations.
 
 // GetObjectNInfo returns a minio.GetObjectReader that satisfies the
@@ -456,33 +439,58 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 	switch {
 	// object
 	case name == object:
-		blob, err := conn.OpenBlob("", "blobs", "data", rowID, false)
-		if err != nil {
-			return nil, err
-		}
-
 		info := minio.ObjectInfo{
 			Bucket:  bucket,
 			Name:    object,
-			Size:    blob.Size(),
 			ModTime: modified,
+		}
+
+		stmt := conn.Prep("SELECT rowid FROM blobs WHERE id = ? ORDER BY part_id;")
+		stmt.BindInt64(1, rowID)
+
+		var blobs []*sqlite.Blob
+		defer func() {
+			if connInUse {
+				return
+			}
+			for _, blob := range blobs {
+				blob.Close()
+			}
+		}()
+		for {
+			hasRow, err := stmt.Step()
+			if err != nil {
+				return nil, err
+			}
+			if !hasRow {
+				break
+			}
+
+			rowID := stmt.ColumnInt64(0)
+			blob, err := conn.OpenBlob("", "blobs", "data", rowID, false)
+			if err != nil {
+				return nil, err
+			}
+
+			info.Size += blob.Size()
+			blobs = append(blobs, blob)
 		}
 
 		startOffset, length, err := rs.GetOffsetLength(info.Size)
 		if err != nil {
-			blob.Close()
 			return nil, err
 		}
 
-		rdr, err := blobReader(blob, startOffset, length)
+		rdr, err := newBlobReader(bucket, object, blobs, startOffset, length)
 		if err != nil {
-			blob.Close()
 			return nil, err
 		}
 
 		connInUse = true
 		closer := func() {
-			blob.Close()
+			for _, b := range blobs {
+				b.Close()
+			}
 			s.pool.Put(conn)
 		}
 		return minio.NewGetObjectReaderFromReader(rdr, info, closer), nil
@@ -503,25 +511,42 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		}
 	}
 }
-func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffset int64, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) error {
+func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffset, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) error {
 	conn, err := s.getConn(ctx)
 	if err != nil {
 		return err
 	}
 	defer s.pool.Put(conn)
 
-	rowID, err := getObjectRowID(conn, bucket, object)
-	if err != nil {
-		return err
+	stmt := conn.Prep("SELECT rowid FROM blobs WHERE id = (SELECT blob_id FROM objects WHERE bucket = ? AND object = ?) ORDER BY part_id;")
+	stmt.BindText(1, bucket)
+	stmt.BindText(2, object)
+
+	var blobs []*sqlite.Blob
+	defer func() {
+		for _, blob := range blobs {
+			blob.Close()
+		}
+	}()
+	for {
+		hasRow, err := stmt.Step()
+		if err != nil {
+			return err
+		}
+		if !hasRow {
+			break
+		}
+
+		rowID := stmt.ColumnInt64(0)
+		blob, err := conn.OpenBlob("", "blobs", "data", rowID, false)
+		if err != nil {
+			return err
+		}
+
+		blobs = append(blobs, blob)
 	}
 
-	blob, err := conn.OpenBlob("", "blobs", "data", rowID, false)
-	if err != nil {
-		return err
-	}
-	defer blob.Close()
-
-	rdr, err := blobReader(blob, startOffset, length)
+	rdr, err := newBlobReader(bucket, object, blobs, startOffset, length)
 	if err != nil {
 		return err
 	}
@@ -529,6 +554,87 @@ func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffs
 	_, err = io.Copy(writer, rdr)
 	return err
 }
+
+func newBlobReader(bucket, object string, blobs []*sqlite.Blob, startOffset, length int64) (io.Reader, error) {
+	var r io.Reader
+	switch len(blobs) {
+	// no blobs found
+	case 0:
+		return nil, minio.ObjectNotFound{Bucket: bucket, Object: object}
+
+	// fast path for single blob
+	// TODO: does this really make any difference?
+	case 1:
+		r = blobs[0]
+		if startOffset != 0 {
+			_, err := blobs[0].Seek(startOffset, io.SeekStart)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if length > -1 {
+			// TODO: check startOffset+length>blob.Size()?
+			r = io.LimitReader(r, length)
+		}
+
+	// multiple blobs
+	default:
+		r = &multiBlobReader{
+			blobs:       blobs,
+			startOffset: startOffset,
+			length:      length,
+		}
+	}
+
+	return r, nil
+}
+
+type multiBlobReader struct {
+	idx         int
+	blobs       []*sqlite.Blob
+	startOffset int64
+	length      int64
+}
+
+func (br *multiBlobReader) Read(p []byte) (int, error) {
+	for {
+		if br.idx >= len(br.blobs) {
+			return 0, io.EOF
+		}
+
+		blob := br.blobs[br.idx]
+		size := blob.Size()
+
+		if br.startOffset > 0 {
+			if br.startOffset >= size {
+				br.startOffset -= size
+				blob.Close()
+				br.idx++
+				continue
+			}
+			_, err := blob.Seek(br.startOffset, io.SeekStart)
+			if err != nil {
+				return 0, err
+			}
+			br.startOffset = 0
+		}
+
+		limit := int64(len(p))
+		if br.length > -1 && limit > br.length {
+			limit = br.length
+		}
+		n, err := blob.Read(p[:limit])
+		br.length -= int64(n)
+		if err == io.EOF && br.length > 0 && len(br.blobs) > 1 {
+			blob.Close()
+			br.idx++
+			err = nil
+		}
+		return n, err
+	}
+}
+
 func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts minio.ObjectOptions) (minio.ObjectInfo, error) {
 	conn, err := s.getConn(ctx)
 	if err != nil {
@@ -598,7 +704,7 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *min
 
 	defer sqlitex.Save(conn)(&err)
 
-	stmt := conn.Prep("INSERT INTO blobs (data) VALUES (?);")
+	stmt := conn.Prep("INSERT INTO blobs (id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), ?);")
 	stmt.BindZeroBlob(1, data.Size())
 	_, err = stmt.Step()
 	if err != nil {
@@ -829,11 +935,20 @@ func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, 
 		return "", err
 	}
 
-	stmt := conn.Prep("INSERT INTO uploads (id, bucket, object, metadata) VALUES (?, ?, ?, ?)")
+	// reserve a blob_id
+	stmt := conn.Prep("INSERT INTO blobs (id, part_id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), -1, 0);")
+	_, err = stmt.Step()
+	if err != nil {
+		return "", err
+	}
+	rowID := conn.LastInsertRowID()
+
+	stmt = conn.Prep("INSERT INTO uploads (id, bucket, object, metadata, blob_id) VALUES (?, ?, ?, ?, (SELECT id FROM blobs WHERE rowid = ?))")
 	stmt.BindText(1, id)
 	stmt.BindText(2, bucket)
 	stmt.BindText(3, object)
 	stmt.BindBytes(4, mdJSON)
+	stmt.BindInt64(5, rowID)
 	_, err = stmt.Step()
 	if err != nil {
 		return "", toMinioError(err, errSourceUploads, "")
@@ -841,23 +956,34 @@ func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, 
 
 	return id, nil
 }
+
 func (s *SQLite) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int, startOffset int64, length int64, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (minio.PartInfo, error) {
 	return s.PutObjectPart(ctx, destBucket, destObject, uploadID, partID, srcInfo.PutObjReader, dstOpts)
 }
 
-func uploadExists(conn *sqlite.Conn, bucket, object, uploadID string) error {
-	stmt := conn.Prep("SELECT count(*) FROM uploads WHERE id = ? AND bucket = ? AND object = ?")
+func getBlobID(conn *sqlite.Conn, bucket, object, uploadID string) (int64, error) {
+	stmt := conn.Prep("SELECT blob_id FROM uploads WHERE id = ? AND bucket = ? AND object = ?")
 	stmt.BindText(1, uploadID)
 	stmt.BindText(2, bucket)
 	stmt.BindText(3, object)
-	count, err := sqlitex.ResultInt64(stmt)
-	if err != nil {
-		return toMinioError(err, errSourceUploads, uploadID)
+
+	blobID := int64(-1)
+	for {
+		hasRow, err := stmt.Step()
+		if err != nil {
+			return -1, toMinioError(err, errSourceUploads, uploadID)
+		}
+		if !hasRow {
+			break
+		}
+
+		blobID = stmt.ColumnInt64(0)
 	}
-	if count == 0 {
-		return minio.InvalidUploadID{UploadID: uploadID}
+
+	if blobID == -1 {
+		return -1, minio.InvalidUploadID{UploadID: uploadID}
 	}
-	return nil
+	return blobID, nil
 }
 
 func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *minio.PutObjReader, opts minio.ObjectOptions) (_ minio.PartInfo, err error) {
@@ -869,13 +995,13 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 
 	sqlitex.Save(conn)(&err)
 
-	err = uploadExists(conn, bucket, object, uploadID)
+	blobID, err := getBlobID(conn, bucket, object, uploadID)
 	if err != nil {
 		return minio.PartInfo{}, err
 	}
 
-	stmt := conn.Prep("INSERT INTO parts (upload_id, part_id, data) VALUES (?, ?, ?) ON CONFLICT (upload_id, part_id) DO UPDATE SET data = excluded.data;")
-	stmt.BindText(1, uploadID) // TODO: validate
+	stmt := conn.Prep("INSERT INTO blobs (id, part_id, data) VALUES (?, ?, ?) ON CONFLICT (id, part_id) DO UPDATE SET data = excluded.data;")
+	stmt.BindInt64(1, blobID)
 	stmt.BindInt64(2, int64(partID))
 	stmt.BindZeroBlob(3, data.Size())
 	_, err = stmt.Step()
@@ -883,12 +1009,16 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 		return minio.PartInfo{}, err
 	}
 
-	rowID, err := lastPartUpsertRowID(conn, uploadID, int64(partID))
+	// must query rowid since last insert will be incorrect on upsert
+	stmt = conn.Prep("SELECT rowid FROM blobs WHERE id = ? AND part_id = ?")
+	stmt.BindInt64(1, blobID)
+	stmt.BindInt64(2, int64(partID))
+	rowID, err := sqlitex.ResultInt64(stmt)
 	if err != nil {
 		return minio.PartInfo{}, err
 	}
 
-	blob, err := conn.OpenBlob("", "parts", "data", rowID, true)
+	blob, err := conn.OpenBlob("", "blobs", "data", rowID, true)
 	if err != nil {
 		return minio.PartInfo{}, err
 	}
@@ -901,6 +1031,7 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 
 	return minio.PartInfo{PartNumber: partID}, nil
 }
+
 func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int) (minio.ListPartsInfo, error) {
 	res := minio.ListPartsInfo{
 		Bucket:           bucket,
@@ -918,13 +1049,13 @@ func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID s
 	}
 	defer s.pool.Put(conn)
 
-	err = uploadExists(conn, bucket, object, uploadID)
+	blobID, err := getBlobID(conn, bucket, object, uploadID)
 	if err != nil {
 		return minio.ListPartsInfo{}, err
 	}
 
-	stmt := conn.Prep("SELECT part_id, length(data) FROM parts WHERE upload_id = ? ORDER BY part_id LIMIT ?;")
-	stmt.BindText(1, uploadID)
+	stmt := conn.Prep("SELECT part_id, length(data) FROM blobs WHERE id = ? AND part_id <> -1 ORDER BY part_id LIMIT ?;")
+	stmt.BindInt64(1, blobID)
 	stmt.BindInt64(2, int64(maxParts)+1)
 
 	var count int
@@ -957,15 +1088,29 @@ func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID s
 
 	return res, nil
 }
-func (s *SQLite) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) error {
+func (s *SQLite) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) (err error) {
 	conn, err := s.getConn(ctx)
 	if err != nil {
 		return err
 	}
 	defer s.pool.Put(conn)
 
+	sqlitex.Save(conn)(&err)
+
+	blobID, err := getBlobID(conn, bucket, object, uploadID)
+	if err != nil {
+		return err
+	}
+
 	stmt := conn.Prep("DELETE FROM uploads WHERE id = ?;")
 	stmt.BindText(1, uploadID)
+	_, err = stmt.Step()
+	if err != nil {
+		return toMinioError(err, errSourceUploads, uploadID)
+	}
+
+	stmt = conn.Prep("DELETE FROM blobs WHERE id = ?;")
+	stmt.BindInt64(1, blobID)
 	_, err = stmt.Step()
 	return toMinioError(err, errSourceUploads, uploadID)
 }
@@ -979,69 +1124,68 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 
 	defer sqlitex.Save(conn)(&err)
 
-	// determine complete size
-	var (
-		size       int64
-		partRowIDs = make([]int64, len(uploadedParts))
-	)
-	for i, part := range uploadedParts {
-		stmt := conn.Prep("SELECT rowid, length(data) FROM parts WHERE upload_id = ? AND part_id = ? ORDER BY part_id")
-		stmt.BindText(1, uploadID)
-		stmt.BindInt64(2, int64(part.PartNumber))
-
-		for {
-			hasRow, err := stmt.Step()
-			if err != nil {
-				return minio.ObjectInfo{}, toMinioError(err, errSourceParts, uploadID)
-			}
-			if !hasRow {
-				break
-			}
-
-			partRowIDs[i] = stmt.ColumnInt64(0)
-			size += stmt.ColumnInt64(1)
-		}
-	}
-
-	stmt := conn.Prep("INSERT INTO blobs (data) VALUES (?);")
-	stmt.BindZeroBlob(1, size)
-	_, err = stmt.Step()
+	blobID, err := getBlobID(conn, bucket, object, uploadID)
 	if err != nil {
 		return minio.ObjectInfo{}, err
 	}
 
-	rowID := conn.LastInsertRowID()
-	objBlob, err := conn.OpenBlob("", "blobs", "data", rowID, true)
+	// get existing parts
+	stmt := conn.Prep("SELECT part_id FROM blobs WHERE id = ?;")
 	if err != nil {
 		return minio.ObjectInfo{}, err
 	}
-	defer objBlob.Close()
+	stmt.BindInt64(1, blobID)
 
-	// concat parts into blob
-	for _, rowID := range partRowIDs {
-		partBlob, err := conn.OpenBlob("", "parts", "data", rowID, false)
+	dbPartIDs := make(map[int]struct{})
+	for {
+		hasRow, err := stmt.Step()
 		if err != nil {
-			return minio.ObjectInfo{}, toMinioError(err, errSourceParts, uploadID)
+			return minio.ObjectInfo{}, err
+		}
+		if !hasRow {
+			break
 		}
 
-		_, err = io.Copy(objBlob, partBlob)
-		partBlob.Close()
+		id := stmt.ColumnInt(0)
+		dbPartIDs[id] = struct{}{}
+	}
+
+	// validate part numbers
+	// TODO: validate etags
+	for _, part := range uploadedParts {
+		if _, ok := dbPartIDs[part.PartNumber]; !ok {
+			return minio.ObjectInfo{}, minio.InvalidPart{PartNumber: part.PartNumber}
+		}
+		delete(dbPartIDs, part.PartNumber)
+	}
+
+	// remove any extraneous parts, including marker part_id of -1
+	for partID := range dbPartIDs {
+		stmt = conn.Prep("DELETE FROM blobs WHERE id = ? AND part_id = ?;")
+		stmt.BindInt64(1, blobID)
+		stmt.BindInt64(2, int64(partID))
+		_, err = stmt.Step()
 		if err != nil {
-			return minio.ObjectInfo{}, toMinioError(err, errSourceParts, uploadID)
+			return minio.ObjectInfo{}, toMinioError(err, errSourceUploads, uploadID)
 		}
 	}
 
 	// create object
-	// TODO: check if bucket exists?
 	stmt = conn.Prep(`
-		INSERT INTO objects (bucket, object, size, metadata, modified, blob_id) VALUES (?, ?, ?, (SELECT metadata FROM uploads WHERE id = ?), ?, ?)
+		INSERT INTO objects (bucket, object, size, metadata, modified, blob_id) VALUES (
+			?1,
+			?2,
+			(SELECT SUM(LENGTH(data)) FROM blobs WHERE id = ?3),
+			(SELECT metadata FROM uploads WHERE id = ?4),
+			?5,
+			?3
+		)
 		ON CONFLICT (bucket, object) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, modified=excluded.modified, blob_id=excluded.blob_id;`)
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
-	stmt.BindInt64(3, size)
+	stmt.BindInt64(3, blobID)
 	stmt.BindText(4, uploadID)
 	stmt.BindInt64(5, time.Now().UnixNano())
-	stmt.BindInt64(6, rowID)
 	_, err = stmt.Step()
 	if err != nil {
 		return minio.ObjectInfo{}, toMinioError(err, errSourceObjects, object)
@@ -1167,70 +1311,3 @@ func (s *SQLite) DeleteBucketPolicy(ctx context.Context, bucket string) error {
 func (s *SQLite) IsNotificationSupported() bool { return true }
 func (s *SQLite) IsEncryptionSupported() bool   { return true }
 func (s *SQLite) IsCompressionSupported() bool  { return true }
-
-func getObjectRowID(conn *sqlite.Conn, bucket, object string) (int64, error) {
-	stmt := conn.Prep("SELECT blob_id FROM objects WHERE bucket = ? AND object = ?;")
-	stmt.BindText(1, bucket)
-	stmt.BindText(2, object)
-
-	rowID := int64(-1)
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return rowID, err
-		}
-		if !hasRow {
-			break
-		}
-		if rowID != -1 {
-			panic("too many results for " + bucket + "/" + object) // TODO: error
-		}
-
-		rowID = stmt.ColumnInt64(0)
-	}
-
-	if rowID == -1 {
-		return rowID, minio.ObjectNotFound{
-			Bucket: bucket,
-			Object: object,
-		}
-	}
-	return rowID, nil
-}
-
-func lastPartUpsertRowID(conn *sqlite.Conn, uploadID string, partNumber int64) (int64, error) {
-	// TODO: is this safe for upsert? will it return 0 or that last successful insert?
-	rowID := conn.LastInsertRowID()
-	if rowID > 0 {
-		return rowID, nil
-	}
-
-	return getPartRowID(conn, uploadID, partNumber)
-}
-
-func getPartRowID(conn *sqlite.Conn, uploadID string, partNumber int64) (int64, error) {
-	stmt := conn.Prep("SELECT rowid FROM parts WHERE upload_id = ? AND part_id = ?;")
-	stmt.BindText(1, uploadID)
-	stmt.BindInt64(2, partNumber)
-
-	rowID := int64(-1)
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return rowID, err
-		}
-		if !hasRow {
-			break
-		}
-		if rowID != -1 {
-			panic("too many results for " + uploadID + " " + strconv.FormatInt(partNumber, 10)) // TODO: error
-		}
-
-		rowID = stmt.GetInt64("rowid")
-	}
-
-	if rowID == -1 {
-		return 0, errors.New("part not found")
-	}
-	return rowID, nil
-}
