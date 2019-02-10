@@ -67,7 +67,7 @@ func NewSQLiteLayer(uri *url.URL) (minio.ObjectLayer, error) {
 		return nil, err
 	}
 
-	// return s, nil
+	return s, nil
 	return &debug.DebugLayer{Wrapped: s, LogCallers: 1}, nil
 }
 
@@ -83,12 +83,12 @@ const sqlInit = `
 		data BLOB
 	);
 	CREATE TABLE IF NOT EXISTS objects (
-		bucket   TEXT,
+		bucket   TEXT REFERENCES buckets ON DELETE CASCADE ON UPDATE CASCADE,
 		object   TEXT,
 		metadata TEXT,
 		size     INTEGER,
 		modified INTEGER,
-		blob_id  INTEGER REFERENCES blobs(id) ON DELETE RESTRICT,
+		blob_id  INTEGER REFERENCES blobs ON DELETE RESTRICT,
 		PRIMARY KEY (bucket, object)
 	) WITHOUT ROWID;
 	CREATE TABLE IF NOT EXISTS uploads (
@@ -98,7 +98,7 @@ const sqlInit = `
 		metadata TEXT
 	);
 	CREATE TABLE IF NOT EXISTS parts (
-		upload_id TEXT,
+		upload_id TEXT REFERENCES uploads ON DELETE CASCADE,
 		part_id   INTEGER,
 		data      BLOB,
 		PRIMARY KEY (upload_id, part_id)
@@ -296,20 +296,12 @@ func (s *SQLite) DeleteBucket(ctx context.Context, bucket string) (err error) {
 	}
 	defer s.pool.Put(conn)
 
-	defer sqlitex.Save(conn)(&err)
-
 	stmt := conn.Prep("DELETE FROM buckets WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
 	_, err = stmt.Step()
-	if err != nil {
-		return toMinioError(err, errSourceBuckets, bucket)
-	}
-
-	stmt = conn.Prep("DELETE FROM objects WHERE bucket = ?;")
-	stmt.BindText(1, bucket)
-	_, err = stmt.Step()
-	return toMinioError(err, errSourceObjects, bucket)
+	return toMinioError(err, errSourceBuckets, bucket)
 }
+
 func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (minio.ListObjectsInfo, error) {
 	conn, err := s.getConn(ctx)
 	if err != nil {
@@ -972,20 +964,12 @@ func (s *SQLite) AbortMultipartUpload(ctx context.Context, bucket, object, uploa
 	}
 	defer s.pool.Put(conn)
 
-	stmt := conn.Prep("DELETE FROM parts WHERE upload_id = ?;")
+	stmt := conn.Prep("DELETE FROM uploads WHERE id = ?;")
 	stmt.BindText(1, uploadID)
 	_, err = stmt.Step()
-	if err != nil {
-		return toMinioError(err, errSourceParts, uploadID)
-	}
-	stmt = conn.Prep("DELETE FROM uploads WHERE id = ?;")
-	stmt.BindText(1, uploadID)
-	_, err = stmt.Step()
-	if err != nil {
-		return toMinioError(err, errSourceUploads, uploadID)
-	}
-	return nil
+	return toMinioError(err, errSourceUploads, uploadID)
 }
+
 func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []minio.CompletePart, opts minio.ObjectOptions) (_ minio.ObjectInfo, err error) {
 	conn, err := s.getConn(ctx)
 	if err != nil {
@@ -1054,7 +1038,7 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 		ON CONFLICT (bucket, object) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, modified=excluded.modified, blob_id=excluded.blob_id;`)
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
-	stmt.BindZeroBlob(3, size)
+	stmt.BindInt64(3, size)
 	stmt.BindText(4, uploadID)
 	stmt.BindInt64(5, time.Now().UnixNano())
 	stmt.BindInt64(6, rowID)
@@ -1064,12 +1048,6 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	}
 
 	// remove upload
-	stmt = conn.Prep("DELETE FROM parts WHERE upload_id = ?;")
-	stmt.BindText(1, uploadID)
-	_, err = stmt.Step()
-	if err != nil {
-		return minio.ObjectInfo{}, toMinioError(err, errSourceParts, uploadID)
-	}
 	stmt = conn.Prep("DELETE FROM uploads WHERE id = ?;")
 	stmt.BindText(1, uploadID)
 	_, err = stmt.Step()
@@ -1189,16 +1167,6 @@ func (s *SQLite) DeleteBucketPolicy(ctx context.Context, bucket string) error {
 func (s *SQLite) IsNotificationSupported() bool { return true }
 func (s *SQLite) IsEncryptionSupported() bool   { return true }
 func (s *SQLite) IsCompressionSupported() bool  { return true }
-
-func lastObjectUpsertRowID(conn *sqlite.Conn, bucket, object string) (int64, error) {
-	// TODO: is this safe for upsert? will it return 0 or that last successful insert?
-	rowID := conn.LastInsertRowID()
-	if rowID > 0 {
-		return rowID, nil
-	}
-
-	return getObjectRowID(conn, bucket, object)
-}
 
 func getObjectRowID(conn *sqlite.Conn, bucket, object string) (int64, error) {
 	stmt := conn.Prep("SELECT blob_id FROM objects WHERE bucket = ? AND object = ?;")
