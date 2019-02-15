@@ -31,8 +31,6 @@ import (
 
 	// Import gateway
 	_ "github.com/minio/minio/cmd/gateway"
-
-	_ "github.com/minio/minio/cmd/sqlite"
 )
 
 func main() {

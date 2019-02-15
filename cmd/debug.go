@@ -1,4 +1,4 @@
-package debug
+package cmd
 
 import (
 	"bytes"
@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	minio "github.com/minio/minio/cmd"
 	"github.com/minio/minio/pkg/madmin"
 	"github.com/minio/minio/pkg/policy"
 )
@@ -19,7 +18,7 @@ import (
 type DebugLayer struct {
 	id uint64
 
-	Wrapped    minio.ObjectLayer
+	Wrapped    ObjectLayer
 	LogReturns bool
 	LogTiming  bool
 	LogCallers int
@@ -92,7 +91,7 @@ func (l *DebugLayer) Shutdown(ctx context.Context) (err error) {
 	return l.Wrapped.Shutdown(ctx)
 }
 
-func (l *DebugLayer) StorageInfo(ctx context.Context) (res minio.StorageInfo) {
+func (l *DebugLayer) StorageInfo(ctx context.Context) (res StorageInfo) {
 	defer l.tracef("StorageInfo(%v)\n", ctx)(&res)
 	return l.Wrapped.StorageInfo(ctx)
 }
@@ -102,11 +101,11 @@ func (l *DebugLayer) MakeBucketWithLocation(ctx context.Context, bucket string, 
 	return l.Wrapped.MakeBucketWithLocation(ctx, bucket, location)
 }
 
-func (l *DebugLayer) GetBucketInfo(ctx context.Context, bucket string) (res minio.BucketInfo, err error) {
+func (l *DebugLayer) GetBucketInfo(ctx context.Context, bucket string) (res BucketInfo, err error) {
 	defer l.tracef("GetBucketInfo(%v, %q)\n", ctx, bucket)(&res, &err)
 	return l.Wrapped.GetBucketInfo(ctx, bucket)
 }
-func (l *DebugLayer) ListBuckets(ctx context.Context) (res []minio.BucketInfo, err error) {
+func (l *DebugLayer) ListBuckets(ctx context.Context) (res []BucketInfo, err error) {
 	defer l.tracef("ListBuckets(%v)\n", ctx)(&res, &err)
 	return l.Wrapped.ListBuckets(ctx)
 }
@@ -114,33 +113,33 @@ func (l *DebugLayer) DeleteBucket(ctx context.Context, bucket string) (err error
 	defer l.tracef("DeleteBucket(%v, %q)\n", ctx, bucket)
 	return l.Wrapped.DeleteBucket(ctx, bucket)
 }
-func (l *DebugLayer) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (res minio.ListObjectsInfo, err error) {
+func (l *DebugLayer) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (res ListObjectsInfo, err error) {
 	defer l.tracef("ListObjects(%v, %q, %q, %q, %q, %d)\n", ctx, bucket, prefix, marker, delimiter, maxKeys)(&res, &err)
 	return l.Wrapped.ListObjects(ctx, bucket, prefix, marker, delimiter, maxKeys)
 }
-func (l *DebugLayer) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (res minio.ListObjectsV2Info, err error) {
+func (l *DebugLayer) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (res ListObjectsV2Info, err error) {
 	defer l.tracef("ListObjectsV2(%v, %q, %q, %q, %q, %d, %t, %q)\n", ctx, bucket, prefix, continuationToken, delimiter, maxKeys, fetchOwner, startAfter)(&res, &err)
 	return l.Wrapped.ListObjectsV2(ctx, bucket, prefix, continuationToken, delimiter, maxKeys, fetchOwner, startAfter)
 }
 
 // Object operations.
-func (l *DebugLayer) GetObjectNInfo(ctx context.Context, bucket, object string, rs *minio.HTTPRangeSpec, h http.Header, lockType minio.LockType, opts minio.ObjectOptions) (res *minio.GetObjectReader, err error) {
+func (l *DebugLayer) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (res *GetObjectReader, err error) {
 	defer l.tracef("GetObjectNInfo(%v, %q, %q, %v, %v, %v, %v)\n", ctx, bucket, object, rs, h, lockType, opts)(&res, &err)
 	return l.Wrapped.GetObjectNInfo(ctx, bucket, object, rs, h, lockType, opts)
 }
-func (l *DebugLayer) GetObject(ctx context.Context, bucket, object string, startOffset, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) (err error) {
+func (l *DebugLayer) GetObject(ctx context.Context, bucket, object string, startOffset, length int64, writer io.Writer, etag string, opts ObjectOptions) (err error) {
 	defer l.tracef("GetObject(%v, %q, %q, %d, %d, writer, %q, %v)\n", ctx, bucket, object, startOffset, length, etag, opts)(&err)
 	return l.Wrapped.GetObject(ctx, bucket, object, startOffset, length, writer, etag, opts)
 }
-func (l *DebugLayer) GetObjectInfo(ctx context.Context, bucket, object string, opts minio.ObjectOptions) (res minio.ObjectInfo, err error) {
+func (l *DebugLayer) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (res ObjectInfo, err error) {
 	defer l.tracef("GetObjectInfo(%v, %q, %q, %v)\n", ctx, bucket, object, opts)(&res, &err)
 	return l.Wrapped.GetObjectInfo(ctx, bucket, object, opts)
 }
-func (l *DebugLayer) PutObject(ctx context.Context, bucket, object string, data *minio.PutObjReader, metadata map[string]string, opts minio.ObjectOptions) (res minio.ObjectInfo, err error) {
+func (l *DebugLayer) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, metadata map[string]string, opts ObjectOptions) (res ObjectInfo, err error) {
 	defer l.tracef("PutObject(%v, %q, %q, data, %v, %v)\n", ctx, bucket, object, metadata, opts)(&res, &err)
 	return l.Wrapped.PutObject(ctx, bucket, object, data, metadata, opts)
 }
-func (l *DebugLayer) CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (res minio.ObjectInfo, err error) {
+func (l *DebugLayer) CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (res ObjectInfo, err error) {
 	defer l.tracef("CopyObject(%v, %q, %q, %q, %q, %v, %v, %v)\n", ctx, srcBucket, srcObject, destBucket, destObject, srcInfo, srcOpts, dstOpts)(&res, &err)
 	return l.Wrapped.CopyObject(ctx, srcBucket, srcObject, destBucket, destObject, srcInfo, srcOpts, dstOpts)
 }
@@ -150,23 +149,23 @@ func (l *DebugLayer) DeleteObject(ctx context.Context, bucket, object string) (e
 }
 
 // Multipart operations.
-func (l *DebugLayer) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (res minio.ListMultipartsInfo, err error) {
+func (l *DebugLayer) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (res ListMultipartsInfo, err error) {
 	defer l.tracef("ListMultipartUploads(%v, %q, %q, %q, %q, %q, %d)\n", ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)(&res, &err)
 	return l.Wrapped.ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 }
-func (l *DebugLayer) NewMultipartUpload(ctx context.Context, bucket, object string, metadata map[string]string, opts minio.ObjectOptions) (res string, err error) {
+func (l *DebugLayer) NewMultipartUpload(ctx context.Context, bucket, object string, metadata map[string]string, opts ObjectOptions) (res string, err error) {
 	defer l.tracef("NewMultipartUpload(%v, %q, %q, %v, %v)\n", ctx, bucket, object, metadata, opts)(&res, &err)
 	return l.Wrapped.NewMultipartUpload(ctx, bucket, object, metadata, opts)
 }
-func (l *DebugLayer) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int, startOffset, length int64, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (res minio.PartInfo, err error) {
+func (l *DebugLayer) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int, startOffset, length int64, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (res PartInfo, err error) {
 	defer l.tracef("CopyObjectPart(%v, %q, %q, %q, %q, %d, %d, %d, %v, %v, %v)", srcBucket, srcObject, destBucket, destObject, uploadID, partID, startOffset, length, srcInfo, srcOpts, dstOpts)(&res, &err)
 	return l.Wrapped.CopyObjectPart(ctx, srcBucket, srcObject, destBucket, destObject, uploadID, partID, startOffset, length, srcInfo, srcOpts, dstOpts)
 }
-func (l *DebugLayer) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *minio.PutObjReader, opts minio.ObjectOptions) (res minio.PartInfo, err error) {
+func (l *DebugLayer) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *PutObjReader, opts ObjectOptions) (res PartInfo, err error) {
 	defer l.tracef("PutObjectPart(%v, %q, %q, %q, %d, data, %v)\n", ctx, bucket, object, uploadID, partID, opts)(&res, &err)
 	return l.Wrapped.PutObjectPart(ctx, bucket, object, uploadID, partID, data, opts)
 }
-func (l *DebugLayer) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker, maxParts int) (res minio.ListPartsInfo, err error) {
+func (l *DebugLayer) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker, maxParts int) (res ListPartsInfo, err error) {
 	defer l.tracef("ListObjectParts(%v, %q, %q, %q, %d, %d)\n", ctx, bucket, object, uploadID, partNumberMarker, maxParts)(&res, &err)
 	return l.Wrapped.ListObjectParts(ctx, bucket, object, uploadID, partNumberMarker, maxParts)
 }
@@ -174,7 +173,7 @@ func (l *DebugLayer) AbortMultipartUpload(ctx context.Context, bucket, object, u
 	defer l.tracef("AbortMultipartUpload(%v, %q, %q, %q)\n", ctx, bucket, object, uploadID)(&err)
 	return l.Wrapped.AbortMultipartUpload(ctx, bucket, object, uploadID)
 }
-func (l *DebugLayer) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []minio.CompletePart, opts minio.ObjectOptions) (res minio.ObjectInfo, err error) {
+func (l *DebugLayer) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart, opts ObjectOptions) (res ObjectInfo, err error) {
 	defer l.tracef("CompleteMultipartUpload(%v, %q, %q, %q, %v, %v)\n", ctx, bucket, object, uploadID, uploadedParts, opts)(&res, &err)
 	return l.Wrapped.CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, opts)
 }
@@ -196,11 +195,11 @@ func (l *DebugLayer) HealObject(ctx context.Context, bucket, object string, dryR
 	defer l.tracef("HealObject(%v, %q, %q, %t)\n", ctx, bucket, object, dryRun)(&res, &err)
 	return l.Wrapped.HealObject(ctx, bucket, object, dryRun)
 }
-func (l *DebugLayer) ListBucketsHeal(ctx context.Context) (res []minio.BucketInfo, err error) {
+func (l *DebugLayer) ListBucketsHeal(ctx context.Context) (res []BucketInfo, err error) {
 	defer l.tracef("ListBucketsHeal(%v)\n", ctx)(&res, &err)
 	return l.Wrapped.ListBucketsHeal(ctx)
 }
-func (l *DebugLayer) ListObjectsHeal(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (res minio.ListObjectsInfo, err error) {
+func (l *DebugLayer) ListObjectsHeal(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (res ListObjectsInfo, err error) {
 	defer l.tracef("ListObjectsHeal(%v, %q, %q, %q, %q, %d)\n", ctx, bucket, prefix, marker, delimiter, maxKeys)(&res, &err)
 	return l.Wrapped.ListObjectsHeal(ctx, bucket, prefix, marker, delimiter, maxKeys)
 }

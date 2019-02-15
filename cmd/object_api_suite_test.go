@@ -111,7 +111,7 @@ func testMultipartObjectCreation(obj ObjectLayer, instanceType string, t TestErr
 			t.Errorf("%s: <ERROR> %s", instanceType, err)
 		}
 		if calcPartInfo.ETag != expectedETaghex {
-			t.Errorf("MD5 Mismatch")
+			t.Errorf("MD5 Mismatch: %q | %q", calcPartInfo.ETag, expectedETaghex)
 		}
 		completedParts.Parts = append(completedParts.Parts, CompletePart{
 			PartNumber: i,
@@ -123,7 +123,7 @@ func testMultipartObjectCreation(obj ObjectLayer, instanceType string, t TestErr
 		t.Fatalf("%s: <ERROR> %s", instanceType, err)
 	}
 	if objInfo.ETag != "7d364cb728ce42a74a96d22949beefb2-10" {
-		t.Errorf("Md5 mismtch")
+		t.Errorf("MD5 Mismatch: %q | %q", objInfo.ETag, "7d364cb728ce42a74a96d22949beefb2-10")
 	}
 }
 

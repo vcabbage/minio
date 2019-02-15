@@ -1,4 +1,4 @@
-package sqlite
+package cmd
 
 import (
 	"bytes"
@@ -8,30 +8,20 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"crawshaw.io/sqlite"
 	"crawshaw.io/sqlite/sqlitex"
-	minio "github.com/minio/minio/cmd"
-	"github.com/minio/minio/cmd/debug"
-	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/madmin"
+	"github.com/minio/minio/pkg/mimedb"
 	"github.com/minio/minio/pkg/policy"
-	"github.com/skyrings/skyring-common/tools/uuid"
 )
 
 // TODO: etags
 // TODO: parse metadata
-
-// TODO: copied
-const minioMetaBucket = ".minio.sys"
-
-func init() {
-	// TODO: remove awful hack
-	minio.NewSQLiteLayer = NewSQLiteLayer
-}
 
 type SQLite struct {
 	pool   *sqlitex.Pool
@@ -42,7 +32,7 @@ var (
 	errDBClosed = errors.New("db closed")
 )
 
-func NewSQLiteLayer(uri *url.URL) (minio.ObjectLayer, error) {
+func NewSQLiteLayer(uri *url.URL) (ObjectLayer, error) {
 	if uri.Scheme == "sqlite" {
 		uri.Scheme = "file"
 	}
@@ -62,12 +52,17 @@ func NewSQLiteLayer(uri *url.URL) (minio.ObjectLayer, error) {
 	}
 
 	return s, nil
-	return &debug.DebugLayer{Wrapped: s, LogReturns: false, LogCallers: 1}, nil
+	return &DebugLayer{Wrapped: s, LogReturns: true, LogCallers: 1}, nil
 }
 
 // Multipart uploads are maintained as individual parts to avoid
 // the overhead of recombining on completion. This also allows objects
 // larger than SQLITE_MAX_LENGTH to be stored.
+
+// objects table uses "WITHOUT ROWID" because early experimentation found it to
+// be faster for listing objects in a bucket. Since there are tradeoffs to this
+// the results should be checked again once the implementation is complete.
+// https://www.sqlite.org/withoutrowid.html
 
 // timestamps are nanoseconds since unix epoch
 const sqlInit = `
@@ -79,6 +74,7 @@ const sqlInit = `
 	CREATE TABLE IF NOT EXISTS blobs (
 		id      INTEGER NOT NULL,
 		part_id INTEGER NOT NULL DEFAULT 0,
+		etag    TEXT,
 		data    BLOB NOT NULL,
 		PRIMARY KEY (id, part_id)
 	);
@@ -89,6 +85,8 @@ const sqlInit = `
 		size     INTEGER NOT NULL,
 		modified INTEGER NOT NULL,
 		blob_id  INTEGER NOT NULL,
+		etag     TEXT NOT NULL,
+		content_type TEXT NOT NULL,
 		PRIMARY KEY (bucket, object)
 	) WITHOUT ROWID;
 	CREATE TABLE IF NOT EXISTS uploads (
@@ -125,8 +123,7 @@ func (s *SQLite) init() error {
 		return err
 	}
 
-	// TODO: is this necessary?
-	_, err = s.GetBucketInfo(ctx, minioMetaBucket)
+	err = bucketExists(conn, minioMetaBucket)
 	if err == nil {
 		return nil
 	}
@@ -139,11 +136,11 @@ func (s *SQLite) Shutdown(context.Context) error {
 	return s.pool.Close()
 }
 
-func (s *SQLite) StorageInfo(ctx context.Context) minio.StorageInfo {
+func (s *SQLite) StorageInfo(ctx context.Context) StorageInfo {
 	size, _ := s.dbSize(ctx)
 
-	si := minio.StorageInfo{Used: uint64(size)}
-	si.Backend.Type = minio.BackendSQLite
+	si := StorageInfo{Used: uint64(size)}
+	si.Backend.Type = BackendSQLite
 
 	return si
 }
@@ -196,14 +193,14 @@ func toMinioError(err error, source int, srcLabel string) error {
 		case sqlite.SQLITE_CONSTRAINT_PRIMARYKEY:
 			switch source {
 			case errSourceBuckets:
-				return minio.BucketExists{Bucket: srcLabel}
+				return BucketExists{Bucket: srcLabel}
 			case errSourceObjects:
-				return minio.ObjectNotFound{Object: srcLabel} // TODO: include bucket
+				return ObjectNotFound{Object: srcLabel} // TODO: include bucket
 			}
 		case sqlite.SQLITE_FULL:
-			return minio.StorageFull{}
+			return StorageFull{}
 		case sqlite.SQLITE_BUSY:
-			return minio.OperationTimedOut{}
+			return OperationTimedOut{}
 		}
 	}
 	return err
@@ -211,8 +208,8 @@ func toMinioError(err error, source int, srcLabel string) error {
 
 // Bucket operations.
 func (s *SQLite) MakeBucketWithLocation(ctx context.Context, bucket string, location string) error {
-	if !minio.IsValidBucketName(bucket) {
-		return minio.BucketNameInvalid{Bucket: bucket}
+	if !IsValidBucketName(bucket) {
+		return BucketNameInvalid{Bucket: bucket}
 	}
 
 	conn, err := s.getConn(ctx)
@@ -221,6 +218,11 @@ func (s *SQLite) MakeBucketWithLocation(ctx context.Context, bucket string, loca
 	}
 	defer s.pool.Put(conn)
 
+	err = bucketExists(conn, bucket)
+	if err == nil {
+		return BucketExists{Bucket: bucket}
+	}
+
 	stmt := conn.Prep("INSERT INTO buckets (bucket, created) VALUES (?, ?);")
 	stmt.BindText(1, bucket)
 	stmt.BindInt64(2, time.Now().UnixNano())
@@ -228,17 +230,17 @@ func (s *SQLite) MakeBucketWithLocation(ctx context.Context, bucket string, loca
 	return toMinioError(err, errSourceBuckets, bucket)
 }
 
-func (s *SQLite) GetBucketInfo(ctx context.Context, bucket string) (minio.BucketInfo, error) {
+func (s *SQLite) GetBucketInfo(ctx context.Context, bucket string) (BucketInfo, error) {
 	conn, err := s.getConn(ctx)
 	if err != nil {
-		return minio.BucketInfo{}, err
+		return BucketInfo{}, err
 	}
 	defer s.pool.Put(conn)
 
 	stmt := conn.Prep("SELECT created FROM buckets WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
 
-	bi := minio.BucketInfo{Name: bucket}
+	bi := BucketInfo{Name: bucket}
 	for {
 		hasRow, err := stmt.Step()
 		if err != nil {
@@ -252,12 +254,13 @@ func (s *SQLite) GetBucketInfo(ctx context.Context, bucket string) (minio.Bucket
 	}
 
 	if bi.Created.IsZero() {
-		return bi, minio.BucketNotFound{Bucket: bucket}
+		return bi, BucketNotFound{Bucket: bucket}
 	}
 
 	return bi, nil
 }
-func (s *SQLite) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error) {
+
+func (s *SQLite) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 	conn, err := s.getConn(ctx)
 	if err != nil {
 		return nil, err
@@ -266,7 +269,7 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error) {
 
 	stmt := conn.Prep("SELECT bucket, created FROM buckets;")
 
-	var buckets []minio.BucketInfo
+	var buckets []BucketInfo
 	for {
 		hasRow, err := stmt.Step()
 		if err != nil {
@@ -276,12 +279,16 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]minio.BucketInfo, error) {
 			break
 		}
 
-		// TODO: filter reserved/invalid bucket names
+		b := BucketInfo{
+			Name:    stmt.ColumnText(0),
+			Created: columnTime(stmt, 1),
+		}
 
-		buckets = append(buckets, minio.BucketInfo{
-			Name:    stmt.GetText("bucket"),
-			Created: time.Unix(0, stmt.GetInt64("created")),
-		})
+		if isMinioMetaBucketName(b.Name) {
+			continue
+		}
+
+		buckets = append(buckets, b)
 	}
 
 	return buckets, nil
@@ -300,10 +307,22 @@ func (s *SQLite) DeleteBucket(ctx context.Context, bucket string) (err error) {
 	return toMinioError(err, errSourceBuckets, bucket)
 }
 
-func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (minio.ListObjectsInfo, error) {
+func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (ListObjectsInfo, error) {
+	err := checkListObjsArgs(ctx, bucket, prefix, marker, delimiter, s)
+	if err != nil {
+		return ListObjectsInfo{}, err
+	}
+
+	switch {
+	case maxKeys < 0:
+		maxKeys = maxObjectList
+	case maxKeys == 0:
+		return ListObjectsInfo{}, nil
+	}
+
 	conn, err := s.getConn(ctx)
 	if err != nil {
-		return minio.ListObjectsInfo{}, err
+		return ListObjectsInfo{}, err
 	}
 	defer s.pool.Put(conn)
 
@@ -311,18 +330,18 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 	// TODO: is "object > marker" adequate?
 	var stmt *sqlite.Stmt
 	if delimiter == "" {
-		stmt = conn.Prep("SELECT object as name, size, modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' AND object > ? ORDER BY object LIMIT ?;")
+		stmt = conn.Prep("SELECT object as name, size, modified, etag FROM objects WHERE bucket = ? AND object LIKE ? || '%' AND object > ? ORDER BY object LIMIT ?;")
 		stmt.BindText(1, bucket)
 		stmt.BindText(2, prefix)
 		stmt.BindText(3, marker)
 		stmt.BindInt64(4, int64(maxKeys)+1)
 	} else {
 		stmt = conn.Prep(`
-		SELECT DISTINCT $prefix || substr(ltrim(object, $prefix), 1, instr(ltrim(object, $prefix), $delimiter)) as name, 0 as size, 0 as modified, 1 as is_prefix
+		SELECT DISTINCT $prefix || substr(ltrim(object, $prefix), 1, instr(ltrim(object, $prefix), $delimiter)) as name, 0 as size, 0 as modified, '' as etag, 1 as is_prefix
 		FROM objects
 		WHERE bucket = $bucket AND object LIKE $prefix || '%' AND object > $marker AND name <> $prefix
 		UNION
-		SELECT object as name, size, modified, 0 as is_prefix
+		SELECT object as name, size, modified, etag, 0 as is_prefix
 		FROM objects
 		WHERE bucket = $bucket AND object LIKE $prefix || '%' AND object > $marker AND instr(ltrim(object, $prefix), $delimiter) = 0
 		ORDER BY object
@@ -334,7 +353,7 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 		stmt.SetInt64("$max_keys", int64(maxKeys)+1)
 	}
 
-	var objects minio.ListObjectsInfo
+	var objects ListObjectsInfo
 	var count int
 	for {
 		hasRow, err := stmt.Step()
@@ -355,24 +374,26 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 			name     = stmt.GetText("name")
 			size     = stmt.GetInt64("size")
 			modified = time.Unix(0, stmt.GetInt64("modified"))
-			isPrefix = stmt.GetInt64("is_prefix") == 1
+			etag     = stmt.GetText("etag")
+			isPrefix = stmt.GetInt64("is_prefix") == 1 // TODO: this isn't set when no delimiter
 		)
 		objects.NextMarker = name
 		if isPrefix {
 			objects.Prefixes = append(objects.Prefixes, name)
 			continue
 		}
-		objects.Objects = append(objects.Objects, minio.ObjectInfo{
+		objects.Objects = append(objects.Objects, ObjectInfo{
 			Bucket:  bucket,
 			Name:    name,
 			Size:    size,
 			ModTime: modified,
+			ETag:    etag,
 		})
 	}
 
 	return objects, nil
 }
-func (s *SQLite) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (minio.ListObjectsV2Info, error) {
+func (s *SQLite) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (ListObjectsV2Info, error) {
 	// TODO: this implementation copied from FS, safe to assume it's correct?
 	marker := continuationToken
 	if marker == "" {
@@ -381,10 +402,10 @@ func (s *SQLite) ListObjectsV2(ctx context.Context, bucket, prefix, continuation
 
 	v1, err := s.ListObjects(ctx, bucket, prefix, marker, delimiter, maxKeys)
 	if err != nil {
-		return minio.ListObjectsV2Info{}, err
+		return ListObjectsV2Info{}, err
 	}
 
-	return minio.ListObjectsV2Info{
+	return ListObjectsV2Info{
 		IsTruncated:           v1.IsTruncated,
 		ContinuationToken:     continuationToken,
 		NextContinuationToken: v1.NextMarker,
@@ -395,13 +416,20 @@ func (s *SQLite) ListObjectsV2(ctx context.Context, bucket, prefix, continuation
 
 // Object operations.
 
-// GetObjectNInfo returns a minio.GetObjectReader that satisfies the
+// GetObjectNInfo returns a GetObjectReader that satisfies the
 // ReadCloser interface. The Close method unlocks the object
 // after reading, so it must always be called after usage.
 //
 // IMPORTANTLY, when implementations return err != nil, this
 // function MUST NOT return a non-nil ReadCloser.
-func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *minio.HTTPRangeSpec, h http.Header, lockType minio.LockType, opts minio.ObjectOptions) (*minio.GetObjectReader, error) {
+func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (*GetObjectReader, error) {
+	if !IsValidBucketName(bucket) {
+		return nil, BucketNameInvalid{Bucket: bucket}
+	}
+	if !IsValidObjectName(object) {
+		return nil, ObjectNameInvalid{Bucket: bucket, Object: object}
+	}
+
 	conn, err := s.getConn(ctx)
 	if err != nil {
 		return nil, err
@@ -413,14 +441,16 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		}
 	}()
 
-	stmt := conn.Prep("SELECT object, blob_id, modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
+	stmt := conn.Prep("SELECT object, blob_id, modified, size, metadata FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 
 	var (
-		rowID    int64
 		name     string
+		blobID   int64
 		modified time.Time
+		size     int64
+		metadata map[string]string
 	)
 	for {
 		hasRow, err := stmt.Step()
@@ -432,21 +462,40 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		}
 
 		name = stmt.ColumnText(0)
-		rowID = stmt.ColumnInt64(1)
+		blobID = stmt.ColumnInt64(1)
 		modified = columnTime(stmt, 2)
+		size = stmt.ColumnInt64(3)
+		err = json.NewDecoder(stmt.ColumnReader(4)).Decode(&metadata)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	switch {
 	// object
 	case name == object:
-		info := minio.ObjectInfo{
+		startOffset, length, err := rs.GetOffsetLength(size)
+		if err != nil {
+			return nil, err
+		}
+
+		if startOffset > size || startOffset+length > size {
+			return nil, InvalidRange{
+				OffsetBegin:  startOffset,
+				OffsetEnd:    length,
+				ResourceSize: size,
+			}
+		}
+
+		info := ObjectInfo{
 			Bucket:  bucket,
 			Name:    object,
 			ModTime: modified,
+			Size:    size,
 		}
 
 		stmt := conn.Prep("SELECT rowid FROM blobs WHERE id = ? ORDER BY part_id;")
-		stmt.BindInt64(1, rowID)
+		stmt.BindInt64(1, blobID)
 
 		var blobs []*sqlite.Blob
 		defer func() {
@@ -472,13 +521,7 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 				return nil, err
 			}
 
-			info.Size += blob.Size()
 			blobs = append(blobs, blob)
-		}
-
-		startOffset, length, err := rs.GetOffsetLength(info.Size)
-		if err != nil {
-			return nil, err
 		}
 
 		rdr, err := newBlobReader(bucket, object, blobs, startOffset, length)
@@ -493,34 +536,93 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 			}
 			s.pool.Put(conn)
 		}
-		return minio.NewGetObjectReaderFromReader(rdr, info, closer), nil
+		return NewGetObjectReaderFromReader(rdr, info, closer), nil
 
 	// directory
 	case strings.HasSuffix(object, "/") || strings.HasPrefix(strings.TrimPrefix(name, object), "/"):
-		info := minio.ObjectInfo{
+		info := ObjectInfo{
 			Bucket: bucket,
 			Name:   object,
 			IsDir:  true,
 		}
-		return minio.NewGetObjectReaderFromReader(bytes.NewReader(nil), info, func() {}), nil
+		return NewGetObjectReaderFromReader(bytes.NewReader(nil), info, func() {}), nil
 
 	default:
-		return nil, minio.ObjectNotFound{
+		return nil, ObjectNotFound{
 			Bucket: bucket,
 			Object: object,
 		}
 	}
 }
-func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffset, length int64, writer io.Writer, etag string, opts minio.ObjectOptions) error {
+func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffset, length int64, writer io.Writer, etag string, opts ObjectOptions) error {
+	err := checkGetObjArgs(ctx, bucket, object)
+	if err != nil {
+		return err
+	}
+	if startOffset < 0 || writer == nil {
+		return errUnexpected
+	}
+
 	conn, err := s.getConn(ctx)
 	if err != nil {
 		return err
 	}
 	defer s.pool.Put(conn)
 
-	stmt := conn.Prep("SELECT rowid FROM blobs WHERE id = (SELECT blob_id FROM objects WHERE bucket = ? AND object = ?) ORDER BY part_id;")
+	// Check if directory.
+	if hasSuffix(object, slashSeparator) {
+		stmt := conn.Prep("SELECT 1 FROM objects WHERE bucket = ? AND object LIKE ? || '%' LIMIT 1;")
+		stmt.BindText(1, bucket)
+		stmt.BindText(2, object)
+		var exists bool
+		for {
+			hasRow, err := stmt.Step()
+			if err != nil {
+				return err
+			}
+			if !hasRow {
+				break
+			}
+
+			exists = stmt.ColumnInt64(0) == 1
+		}
+		if !exists {
+			return ObjectNotFound{Bucket: bucket, Object: object}
+		}
+		return nil
+	}
+
+	stmt := conn.Prep("SELECT blob_id, size FROM objects WHERE bucket = ? AND object = ?;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
+
+	var (
+		blobID int64
+		size   int64
+	)
+	for {
+		hasRow, err := stmt.Step()
+		if err != nil {
+			return err
+		}
+		if !hasRow {
+			break
+		}
+
+		blobID = stmt.ColumnInt64(0)
+		size = stmt.ColumnInt64(1)
+	}
+
+	if startOffset > size || startOffset+length > size {
+		return InvalidRange{
+			OffsetBegin:  startOffset,
+			OffsetEnd:    length,
+			ResourceSize: size,
+		}
+	}
+
+	stmt = conn.Prep("SELECT rowid FROM blobs WHERE id = ? ORDER BY part_id;")
+	stmt.BindInt64(1, blobID)
 
 	var blobs []*sqlite.Blob
 	defer func() {
@@ -560,7 +662,7 @@ func newBlobReader(bucket, object string, blobs []*sqlite.Blob, startOffset, len
 	switch len(blobs) {
 	// no blobs found
 	case 0:
-		return nil, minio.ObjectNotFound{Bucket: bucket, Object: object}
+		return nil, ObjectNotFound{Bucket: bucket, Object: object}
 
 	// fast path for single blob
 	// TODO: does this really make any difference?
@@ -635,26 +737,40 @@ func (br *multiBlobReader) Read(p []byte) (int, error) {
 	}
 }
 
-func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts minio.ObjectOptions) (minio.ObjectInfo, error) {
+func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+	err := checkGetObjArgs(ctx, bucket, object)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+
 	conn, err := s.getConn(ctx)
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
 	}
 	defer s.pool.Put(conn)
 
-	stmt := conn.Prep("SELECT object, size, modified FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
+	// TODO: run all multiquery in transaction?
+	err = bucketExists(conn, bucket)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+
+	stmt := conn.Prep("SELECT object, size, modified, etag, content_type, metadata FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 
 	var (
-		name     string
-		size     int64
-		modified time.Time
+		name        string
+		size        int64
+		modified    time.Time
+		etag        string
+		contentType string
+		metadata    map[string]string
 	)
 	for {
 		hasRow, err := stmt.Step()
 		if err != nil {
-			return minio.ObjectInfo{}, err
+			return ObjectInfo{}, err
 		}
 		if !hasRow {
 			break
@@ -663,93 +779,126 @@ func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts 
 		name = stmt.ColumnText(0)
 		size = stmt.ColumnInt64(1)
 		modified = columnTime(stmt, 2)
+		etag = stmt.ColumnText(3)
+		contentType = stmt.ColumnText(4)
+		err = json.NewDecoder(stmt.ColumnReader(5)).Decode(&metadata)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
 	}
+
+	isDir := strings.HasSuffix(object, "/")
 
 	switch {
 	// object
-	case name == object:
-		return minio.ObjectInfo{
-			Bucket:  bucket,
-			Name:    object,
-			Size:    size,
-			ModTime: modified,
+	case name == object && !isDir:
+		return ObjectInfo{
+			Bucket:      bucket,
+			Name:        object,
+			Size:        size,
+			ModTime:     modified,
+			ETag:        etag,
+			ContentType: contentType,
+			UserDefined: metadata,
 		}, nil
 
 	// directory
-	case strings.HasSuffix(object, "/") || strings.HasPrefix(strings.TrimPrefix(name, object), "/"):
-		return minio.ObjectInfo{
-			Bucket: bucket,
-			Name:   object,
-			IsDir:  true,
+	case isDir || strings.HasPrefix(strings.TrimPrefix(name, object), "/"): // handle directories that were not explicitly created
+		return ObjectInfo{
+			Bucket:      bucket,
+			Name:        object,
+			IsDir:       true,
+			ContentType: "application/octet-stream",
 		}, nil
 
 	default:
-		return minio.ObjectInfo{}, minio.ObjectNotFound{
+		return ObjectInfo{}, ObjectNotFound{
 			Bucket: bucket,
 			Object: object,
 		}
 	}
 }
-func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *minio.PutObjReader, metadata map[string]string, opts minio.ObjectOptions) (_ minio.ObjectInfo, err error) {
+func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, metadata map[string]string, opts ObjectOptions) (_ ObjectInfo, err error) {
+	size := data.Size()
+	err = checkPutObjectArgs(ctx, bucket, object, s, size)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+
 	mdJSON, err := json.Marshal(metadata)
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
 	}
 
 	conn, err := s.getConn(ctx)
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
 	}
 	defer s.pool.Put(conn)
+
+	// TODO: why does putting this inside the savepoint induce SQLITE_BUSY errors?
+	err = bucketExists(conn, bucket)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
 
 	defer sqlitex.Save(conn)(&err)
 
 	stmt := conn.Prep("INSERT INTO blobs (id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), ?);")
-	stmt.BindZeroBlob(1, data.Size())
+	stmt.BindZeroBlob(1, size)
 	_, err = stmt.Step()
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
 	}
 
 	rowID := conn.LastInsertRowID()
 	blob, err := conn.OpenBlob("", "blobs", "data", rowID, true)
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
 	}
 
-	_, err = io.Copy(blob, data)
+	n, err := io.Copy(blob, data)
 	blob.Close()
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
+	}
+	if n < size {
+		return ObjectInfo{}, IncompleteBody{}
 	}
 
-	// TODO: check if bucket exists?
+	// TODO: apply to copy object
+	etag := data.MD5CurrentHexString()
+	contentType := mimedb.TypeByExtension(path.Ext(object))
+
 	// TODO: handle removal of previous blob
 	stmt = conn.Prep(`
-		INSERT INTO objects (bucket, object, size, metadata, modified, blob_id) VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT (bucket, object) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, modified=excluded.modified, blob_id=excluded.blob_id;`)
+		INSERT INTO objects (bucket, object, size, metadata, modified, blob_id, etag, content_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (bucket, object) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, modified=excluded.modified, blob_id=excluded.blob_id, etag=excluded.etag;`)
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
-	stmt.BindInt64(3, data.Size())
+	stmt.BindInt64(3, size)
 	stmt.BindBytes(4, mdJSON)
 	stmt.BindInt64(5, time.Now().UnixNano())
 	stmt.BindInt64(6, rowID)
+	stmt.BindText(7, etag)
+	stmt.BindText(8, contentType)
 	_, err = stmt.Step()
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
 	}
 
-	return minio.ObjectInfo{
+	return ObjectInfo{
 		Bucket: bucket,
 		Name:   object,
+		ETag:   etag,
 	}, nil
 }
-func (s *SQLite) CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (minio.ObjectInfo, error) {
+func (s *SQLite) CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (ObjectInfo, error) {
 	// TODO: metadata only update
 
 	conn, err := s.getConn(ctx)
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
 	}
 	defer s.pool.Put(conn)
 
@@ -764,10 +913,10 @@ func (s *SQLite) CopyObject(ctx context.Context, srcBucket, srcObject, destBucke
 	stmt.BindText(5, srcObject)
 	_, err = stmt.Step()
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
 	}
 
-	return minio.ObjectInfo{
+	return ObjectInfo{
 		Bucket: destBucket,
 		Name:   destObject,
 	}, nil
@@ -795,7 +944,7 @@ func (s *SQLite) DeleteObject(ctx context.Context, bucket, object string) (err e
 	}
 
 	if conn.Changes() == 0 {
-		return minio.ObjectNotFound{
+		return ObjectNotFound{
 			Bucket: bucket,
 			Object: object,
 		}
@@ -804,19 +953,14 @@ func (s *SQLite) DeleteObject(ctx context.Context, bucket, object string) (err e
 	return nil
 }
 
-// TODO: copied from cmd package
-func mustGetUUID() string {
-	uuid, err := uuid.New()
+// Multipart operations.
+func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (_ ListMultipartsInfo, err error) {
+	err = checkListMultipartArgs(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, s)
 	if err != nil {
-		logger.CriticalIf(context.Background(), err)
+		return ListMultipartsInfo{}, err
 	}
 
-	return uuid.String()
-}
-
-// Multipart operations.
-func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (_ minio.ListMultipartsInfo, err error) {
-	res := minio.ListMultipartsInfo{
+	res := ListMultipartsInfo{
 		KeyMarker:      keyMarker,
 		UploadIDMarker: uploadIDMarker,
 		MaxUploads:     maxUploads,
@@ -827,7 +971,7 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 
 	conn, err := s.getConn(ctx)
 	if err != nil {
-		return res, nil
+		return res, err
 	}
 	defer s.pool.Put(conn)
 
@@ -892,7 +1036,7 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 			res.CommonPrefixes = append(res.CommonPrefixes, name)
 			continue
 		}
-		res.Uploads = append(res.Uploads, minio.MultipartInfo{
+		res.Uploads = append(res.Uploads, MultipartInfo{
 			Object:   name,
 			UploadID: id,
 			// TODO: Initiated
@@ -903,20 +1047,35 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 }
 
 func bucketExists(conn *sqlite.Conn, bucket string) error {
-	stmt := conn.Prep("SELECT count(*) FROM buckets WHERE bucket = ?;")
+	stmt := conn.Prep("SELECT 1 FROM buckets WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
-	count, err := sqlitex.ResultInt64(stmt)
-	if err != nil {
-		return toMinioError(err, errSourceBuckets, bucket)
+
+	var exists bool
+	for {
+		hasRow, err := stmt.Step()
+		if err != nil {
+			return err
+		}
+		if !hasRow {
+			break
+		}
+
+		exists = stmt.ColumnInt64(0) == 1
 	}
-	if count == 0 {
-		return minio.BucketNotFound{Bucket: bucket}
+
+	if !exists {
+		return BucketNotFound{Bucket: bucket}
 	}
 	return nil
 }
 
-func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, metadata map[string]string, opts minio.ObjectOptions) (_ string, err error) {
-	id := mustGetUUID()
+func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, metadata map[string]string, opts ObjectOptions) (_ string, err error) {
+	err = checkNewMultipartArgs(ctx, bucket, object, s)
+	if err != nil {
+		return "", err
+	}
+
+	id := MustGetUUID()
 	mdJSON, err := json.Marshal(metadata)
 	if err != nil {
 		return "", err
@@ -929,11 +1088,6 @@ func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, 
 	defer s.pool.Put(conn)
 
 	sqlitex.Save(conn)(&err)
-
-	err = bucketExists(conn, bucket)
-	if err != nil {
-		return "", err
-	}
 
 	// reserve a blob_id
 	stmt := conn.Prep("INSERT INTO blobs (id, part_id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), -1, 0);")
@@ -957,7 +1111,7 @@ func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, 
 	return id, nil
 }
 
-func (s *SQLite) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int, startOffset int64, length int64, srcInfo minio.ObjectInfo, srcOpts, dstOpts minio.ObjectOptions) (minio.PartInfo, error) {
+func (s *SQLite) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int, startOffset int64, length int64, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (PartInfo, error) {
 	return s.PutObjectPart(ctx, destBucket, destObject, uploadID, partID, srcInfo.PutObjReader, dstOpts)
 }
 
@@ -981,15 +1135,20 @@ func getBlobID(conn *sqlite.Conn, bucket, object, uploadID string) (int64, error
 	}
 
 	if blobID == -1 {
-		return -1, minio.InvalidUploadID{UploadID: uploadID}
+		return -1, InvalidUploadID{UploadID: uploadID}
 	}
 	return blobID, nil
 }
 
-func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *minio.PutObjReader, opts minio.ObjectOptions) (_ minio.PartInfo, err error) {
+func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *PutObjReader, opts ObjectOptions) (_ PartInfo, err error) {
+	err = checkPutObjectPartArgs(ctx, bucket, object, s)
+	if err != nil {
+		return PartInfo{}, err
+	}
+
 	conn, err := s.getConn(ctx)
 	if err != nil {
-		return minio.PartInfo{}, err
+		return PartInfo{}, err
 	}
 	defer s.pool.Put(conn)
 
@@ -997,7 +1156,7 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 
 	blobID, err := getBlobID(conn, bucket, object, uploadID)
 	if err != nil {
-		return minio.PartInfo{}, err
+		return PartInfo{}, err
 	}
 
 	stmt := conn.Prep("INSERT INTO blobs (id, part_id, data) VALUES (?, ?, ?) ON CONFLICT (id, part_id) DO UPDATE SET data = excluded.data;")
@@ -1006,7 +1165,7 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 	stmt.BindZeroBlob(3, data.Size())
 	_, err = stmt.Step()
 	if err != nil {
-		return minio.PartInfo{}, err
+		return PartInfo{}, err
 	}
 
 	// must query rowid since last insert will be incorrect on upsert
@@ -1015,25 +1174,40 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 	stmt.BindInt64(2, int64(partID))
 	rowID, err := sqlitex.ResultInt64(stmt)
 	if err != nil {
-		return minio.PartInfo{}, err
+		return PartInfo{}, err
 	}
 
 	blob, err := conn.OpenBlob("", "blobs", "data", rowID, true)
 	if err != nil {
-		return minio.PartInfo{}, err
+		return PartInfo{}, err
 	}
 	defer blob.Close()
 
 	_, err = io.Copy(blob, data)
 	if err != nil {
-		return minio.PartInfo{}, err
+		return PartInfo{}, err
 	}
 
-	return minio.PartInfo{PartNumber: partID}, nil
+	etag := data.MD5CurrentHexString()
+
+	stmt = conn.Prep("UPDATE blobs SET etag = ? WHERE rowid = ?")
+	stmt.BindText(1, etag)
+	stmt.BindInt64(2, rowID)
+	_, err = stmt.Step()
+	if err != nil {
+		return PartInfo{}, err
+	}
+
+	return PartInfo{PartNumber: partID, ETag: etag}, nil
 }
 
-func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int) (minio.ListPartsInfo, error) {
-	res := minio.ListPartsInfo{
+func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int) (ListPartsInfo, error) {
+	err := checkListPartsArgs(ctx, bucket, object, s)
+	if err != nil {
+		return ListPartsInfo{}, err
+	}
+
+	res := ListPartsInfo{
 		Bucket:           bucket,
 		Object:           object,
 		UploadID:         uploadID,
@@ -1051,12 +1225,13 @@ func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID s
 
 	blobID, err := getBlobID(conn, bucket, object, uploadID)
 	if err != nil {
-		return minio.ListPartsInfo{}, err
+		return ListPartsInfo{}, err
 	}
 
-	stmt := conn.Prep("SELECT part_id, length(data) FROM blobs WHERE id = ? AND part_id <> -1 ORDER BY part_id LIMIT ?;")
+	stmt := conn.Prep("SELECT part_id, length(data), etag FROM blobs WHERE id = ? AND part_id <> -1 AND part_id > ? ORDER BY part_id LIMIT ?;")
 	stmt.BindInt64(1, blobID)
-	stmt.BindInt64(2, int64(maxParts)+1)
+	stmt.BindInt64(2, int64(partNumberMarker))
+	stmt.BindInt64(3, int64(maxParts)+1)
 
 	var count int
 	for {
@@ -1077,18 +1252,29 @@ func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID s
 		var (
 			partID = stmt.ColumnInt(0)
 			size   = stmt.ColumnInt64(1)
+			etag   = stmt.ColumnText(2)
 		)
 
 		res.NextPartNumberMarker = partID
-		res.Parts = append(res.Parts, minio.PartInfo{
+		res.Parts = append(res.Parts, PartInfo{
 			PartNumber: partID,
 			Size:       size,
+			ETag:       etag,
 		})
+	}
+
+	if !res.IsTruncated {
+		res.NextPartNumberMarker = 0
 	}
 
 	return res, nil
 }
 func (s *SQLite) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) (err error) {
+	err = checkAbortMultipartArgs(ctx, bucket, object, s)
+	if err != nil {
+		return err
+	}
+
 	conn, err := s.getConn(ctx)
 	if err != nil {
 		return err
@@ -1096,6 +1282,11 @@ func (s *SQLite) AbortMultipartUpload(ctx context.Context, bucket, object, uploa
 	defer s.pool.Put(conn)
 
 	sqlitex.Save(conn)(&err)
+
+	err = bucketExists(conn, bucket)
+	if err != nil {
+		return err
+	}
 
 	blobID, err := getBlobID(conn, bucket, object, uploadID)
 	if err != nil {
@@ -1115,10 +1306,21 @@ func (s *SQLite) AbortMultipartUpload(ctx context.Context, bucket, object, uploa
 	return toMinioError(err, errSourceUploads, uploadID)
 }
 
-func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []minio.CompletePart, opts minio.ObjectOptions) (_ minio.ObjectInfo, err error) {
+func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart, opts ObjectOptions) (_ ObjectInfo, err error) {
+	err = checkCompleteMultipartArgs(ctx, bucket, object, s)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+
+	contentType := mimedb.TypeByExtension(path.Ext(object))
+	etag, err := getCompleteMultipartMD5(ctx, uploadedParts)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+
 	conn, err := s.getConn(ctx)
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
 	}
 	defer s.pool.Put(conn)
 
@@ -1126,35 +1328,52 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 
 	blobID, err := getBlobID(conn, bucket, object, uploadID)
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
 	}
 
 	// get existing parts
-	stmt := conn.Prep("SELECT part_id FROM blobs WHERE id = ?;")
+	stmt := conn.Prep("SELECT part_id, etag, length(data) FROM blobs WHERE id = ? ORDER BY part_id;")
 	if err != nil {
-		return minio.ObjectInfo{}, err
+		return ObjectInfo{}, err
 	}
 	stmt.BindInt64(1, blobID)
 
-	dbPartIDs := make(map[int]struct{})
+	type partInfo struct {
+		etag string
+		size int64
+	}
+	dbPartIDs := make(map[int]partInfo)
 	for {
 		hasRow, err := stmt.Step()
 		if err != nil {
-			return minio.ObjectInfo{}, err
+			return ObjectInfo{}, err
 		}
 		if !hasRow {
 			break
 		}
 
 		id := stmt.ColumnInt(0)
-		dbPartIDs[id] = struct{}{}
+		etag := stmt.ColumnText(1)
+		size := stmt.ColumnInt64(2)
+		dbPartIDs[id] = partInfo{
+			etag: etag,
+			size: size,
+		}
 	}
 
 	// validate part numbers
-	// TODO: validate etags
-	for _, part := range uploadedParts {
-		if _, ok := dbPartIDs[part.PartNumber]; !ok {
-			return minio.ObjectInfo{}, minio.InvalidPart{PartNumber: part.PartNumber}
+	lastPart := len(uploadedParts) - 1
+	for i, part := range uploadedParts {
+		dbPart, ok := dbPartIDs[part.PartNumber]
+		if !ok || part.ETag != dbPart.etag {
+			return ObjectInfo{}, InvalidPart{PartNumber: part.PartNumber}
+		}
+		if !isMinAllowedPartSize(dbPart.size) && i != lastPart {
+			return ObjectInfo{}, PartTooSmall{
+				PartNumber: part.PartNumber,
+				PartSize:   dbPart.size,
+				PartETag:   part.ETag,
+			}
 		}
 		delete(dbPartIDs, part.PartNumber)
 	}
@@ -1166,19 +1385,21 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 		stmt.BindInt64(2, int64(partID))
 		_, err = stmt.Step()
 		if err != nil {
-			return minio.ObjectInfo{}, toMinioError(err, errSourceUploads, uploadID)
+			return ObjectInfo{}, toMinioError(err, errSourceUploads, uploadID)
 		}
 	}
 
 	// create object
 	stmt = conn.Prep(`
-		INSERT INTO objects (bucket, object, size, metadata, modified, blob_id) VALUES (
+		INSERT INTO objects (bucket, object, size, metadata, modified, blob_id, etag, content_type) VALUES (
 			?1,
 			?2,
 			(SELECT SUM(LENGTH(data)) FROM blobs WHERE id = ?3),
 			(SELECT metadata FROM uploads WHERE id = ?4),
 			?5,
-			?3
+			?3,
+			?6,
+			?7
 		)
 		ON CONFLICT (bucket, object) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, modified=excluded.modified, blob_id=excluded.blob_id;`)
 	stmt.BindText(1, bucket)
@@ -1186,9 +1407,11 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	stmt.BindInt64(3, blobID)
 	stmt.BindText(4, uploadID)
 	stmt.BindInt64(5, time.Now().UnixNano())
+	stmt.BindText(6, etag)
+	stmt.BindText(7, contentType)
 	_, err = stmt.Step()
 	if err != nil {
-		return minio.ObjectInfo{}, toMinioError(err, errSourceObjects, object)
+		return ObjectInfo{}, toMinioError(err, errSourceObjects, object)
 	}
 
 	// remove upload
@@ -1196,33 +1419,34 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	stmt.BindText(1, uploadID)
 	_, err = stmt.Step()
 	if err != nil {
-		return minio.ObjectInfo{}, toMinioError(err, errSourceUploads, uploadID)
+		return ObjectInfo{}, toMinioError(err, errSourceUploads, uploadID)
 	}
 
-	return minio.ObjectInfo{
+	return ObjectInfo{
 		Bucket: bucket,
 		Name:   object,
+		ETag:   etag,
 	}, nil
 }
 
 // Healing operations.
 func (s *SQLite) ReloadFormat(ctx context.Context, dryRun bool) error {
-	return minio.NotImplemented{}
+	return NotImplemented{}
 }
 func (s *SQLite) HealFormat(ctx context.Context, dryRun bool) (madmin.HealResultItem, error) {
-	return madmin.HealResultItem{}, minio.NotImplemented{}
+	return madmin.HealResultItem{}, NotImplemented{}
 }
 func (s *SQLite) HealBucket(ctx context.Context, bucket string, dryRun bool) ([]madmin.HealResultItem, error) {
-	return nil, minio.NotImplemented{}
+	return nil, NotImplemented{}
 }
 func (s *SQLite) HealObject(ctx context.Context, bucket, object string, dryRun bool) (madmin.HealResultItem, error) {
-	return madmin.HealResultItem{}, minio.NotImplemented{}
+	return madmin.HealResultItem{}, NotImplemented{}
 }
-func (s *SQLite) ListBucketsHeal(ctx context.Context) ([]minio.BucketInfo, error) {
-	return nil, minio.NotImplemented{}
+func (s *SQLite) ListBucketsHeal(ctx context.Context) ([]BucketInfo, error) {
+	return nil, NotImplemented{}
 }
-func (s *SQLite) ListObjectsHeal(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (minio.ListObjectsInfo, error) {
-	return minio.ListObjectsInfo{}, minio.NotImplemented{}
+func (s *SQLite) ListObjectsHeal(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (ListObjectsInfo, error) {
+	return ListObjectsInfo{}, NotImplemented{}
 }
 
 // Policy operations
@@ -1247,7 +1471,7 @@ func (s *SQLite) SetBucketPolicy(ctx context.Context, bucket string, policy *pol
 	}
 
 	if conn.Changes() == 0 {
-		return minio.BucketNotFound{Bucket: bucket}
+		return BucketNotFound{Bucket: bucket}
 	}
 
 	return nil
@@ -1281,7 +1505,7 @@ func (s *SQLite) GetBucketPolicy(ctx context.Context, bucket string) (*policy.Po
 	}
 
 	if !hasPolicy {
-		return nil, minio.BucketPolicyNotFound{Bucket: bucket}
+		return nil, BucketPolicyNotFound{Bucket: bucket}
 	}
 
 	blob, err := conn.OpenBlob("", "buckets", "policy", rowID, false)

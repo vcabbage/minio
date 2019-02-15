@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -395,8 +394,6 @@ func serverMain(ctx *cli.Context) {
 
 	handleSignals()
 }
-
-var NewSQLiteLayer func(uri *url.URL) (ObjectLayer, error)
 
 // Initialize object layer with the supplied disks, objectLayer is nil upon any error.
 func newObjectLayer(endpoints EndpointList) (newObject ObjectLayer, err error) {
