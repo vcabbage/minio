@@ -135,9 +135,9 @@ func (l *DebugLayer) GetObjectInfo(ctx context.Context, bucket, object string, o
 	defer l.tracef("GetObjectInfo(%v, %q, %q, %v)\n", ctx, bucket, object, opts)(&res, &err)
 	return l.Wrapped.GetObjectInfo(ctx, bucket, object, opts)
 }
-func (l *DebugLayer) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, metadata map[string]string, opts ObjectOptions) (res ObjectInfo, err error) {
-	defer l.tracef("PutObject(%v, %q, %q, data, %v, %v)\n", ctx, bucket, object, metadata, opts)(&res, &err)
-	return l.Wrapped.PutObject(ctx, bucket, object, data, metadata, opts)
+func (l *DebugLayer) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (res ObjectInfo, err error) {
+	defer l.tracef("PutObject(%v, %q, %q, data, %v)\n", ctx, bucket, object, opts)(&res, &err)
+	return l.Wrapped.PutObject(ctx, bucket, object, data, opts)
 }
 func (l *DebugLayer) CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (res ObjectInfo, err error) {
 	defer l.tracef("CopyObject(%v, %q, %q, %q, %q, %v, %v, %v)\n", ctx, srcBucket, srcObject, destBucket, destObject, srcInfo, srcOpts, dstOpts)(&res, &err)
@@ -153,9 +153,9 @@ func (l *DebugLayer) ListMultipartUploads(ctx context.Context, bucket, prefix, k
 	defer l.tracef("ListMultipartUploads(%v, %q, %q, %q, %q, %q, %d)\n", ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)(&res, &err)
 	return l.Wrapped.ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 }
-func (l *DebugLayer) NewMultipartUpload(ctx context.Context, bucket, object string, metadata map[string]string, opts ObjectOptions) (res string, err error) {
-	defer l.tracef("NewMultipartUpload(%v, %q, %q, %v, %v)\n", ctx, bucket, object, metadata, opts)(&res, &err)
-	return l.Wrapped.NewMultipartUpload(ctx, bucket, object, metadata, opts)
+func (l *DebugLayer) NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (res string, err error) {
+	defer l.tracef("NewMultipartUpload(%v, %q, %q, %v)\n", ctx, bucket, object, opts)(&res, &err)
+	return l.Wrapped.NewMultipartUpload(ctx, bucket, object, opts)
 }
 func (l *DebugLayer) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int, startOffset, length int64, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (res PartInfo, err error) {
 	defer l.tracef("CopyObjectPart(%v, %q, %q, %q, %q, %d, %d, %d, %v, %v, %v)", srcBucket, srcObject, destBucket, destObject, uploadID, partID, startOffset, length, srcInfo, srcOpts, dstOpts)(&res, &err)
@@ -165,9 +165,9 @@ func (l *DebugLayer) PutObjectPart(ctx context.Context, bucket, object, uploadID
 	defer l.tracef("PutObjectPart(%v, %q, %q, %q, %d, data, %v)\n", ctx, bucket, object, uploadID, partID, opts)(&res, &err)
 	return l.Wrapped.PutObjectPart(ctx, bucket, object, uploadID, partID, data, opts)
 }
-func (l *DebugLayer) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker, maxParts int) (res ListPartsInfo, err error) {
-	defer l.tracef("ListObjectParts(%v, %q, %q, %q, %d, %d)\n", ctx, bucket, object, uploadID, partNumberMarker, maxParts)(&res, &err)
-	return l.Wrapped.ListObjectParts(ctx, bucket, object, uploadID, partNumberMarker, maxParts)
+func (l *DebugLayer) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker, maxParts int, opts ObjectOptions) (res ListPartsInfo, err error) {
+	defer l.tracef("ListObjectParts(%v, %q, %q, %q, %d, %d, %v)\n", ctx, bucket, object, uploadID, partNumberMarker, maxParts, opts)(&res, &err)
+	return l.Wrapped.ListObjectParts(ctx, bucket, object, uploadID, partNumberMarker, maxParts, opts)
 }
 func (l *DebugLayer) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) (err error) {
 	defer l.tracef("AbortMultipartUpload(%v, %q, %q, %q)\n", ctx, bucket, object, uploadID)(&err)
@@ -187,13 +187,13 @@ func (l *DebugLayer) HealFormat(ctx context.Context, dryRun bool) (res madmin.He
 	defer l.tracef("HealFormat(%v, %t)\n", ctx, dryRun)(&res, &err)
 	return l.Wrapped.HealFormat(ctx, dryRun)
 }
-func (l *DebugLayer) HealBucket(ctx context.Context, bucket string, dryRun bool) (res []madmin.HealResultItem, err error) {
-	defer l.tracef("HealBucket(%v, %q, %t)\n", ctx, bucket, dryRun)(&res, &err)
-	return l.Wrapped.HealBucket(ctx, bucket, dryRun)
+func (l *DebugLayer) HealBucket(ctx context.Context, bucket string, dryRun, remove bool) (res madmin.HealResultItem, err error) {
+	defer l.tracef("HealBucket(%v, %q, %t, %t)\n", ctx, bucket, dryRun, remove)(&res, &err)
+	return l.Wrapped.HealBucket(ctx, bucket, dryRun, remove)
 }
-func (l *DebugLayer) HealObject(ctx context.Context, bucket, object string, dryRun bool) (res madmin.HealResultItem, err error) {
-	defer l.tracef("HealObject(%v, %q, %q, %t)\n", ctx, bucket, object, dryRun)(&res, &err)
-	return l.Wrapped.HealObject(ctx, bucket, object, dryRun)
+func (l *DebugLayer) HealObject(ctx context.Context, bucket, object string, dryRun, remove bool) (res madmin.HealResultItem, err error) {
+	defer l.tracef("HealObject(%v, %q, %q, %t, %t)\n", ctx, bucket, object, dryRun, remove)(&res, &err)
+	return l.Wrapped.HealObject(ctx, bucket, object, dryRun, remove)
 }
 func (l *DebugLayer) ListBucketsHeal(ctx context.Context) (res []BucketInfo, err error) {
 	defer l.tracef("ListBucketsHeal(%v)\n", ctx)(&res, &err)
@@ -224,6 +224,10 @@ func (l *DebugLayer) DeleteBucketPolicy(ctx context.Context, bucket string) (err
 func (l *DebugLayer) IsNotificationSupported() (res bool) {
 	defer l.tracef("IsNotificationSupported()\n")(&res)
 	return l.Wrapped.IsNotificationSupported()
+}
+func (l *DebugLayer) IsListenBucketSupported() (res bool) {
+	defer l.tracef("IsListenBucketSupported()\n")(&res)
+	return l.Wrapped.IsListenBucketSupported()
 }
 func (l *DebugLayer) IsEncryptionSupported() (res bool) {
 	defer l.tracef("IsEncryptionSupported()\n")(&res)

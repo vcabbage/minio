@@ -422,6 +422,9 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 			ETag:    etag,
 		})
 	}
+	if !objects.IsTruncated {
+		objects.NextMarker = ""
+	}
 
 	return objects, nil
 }
@@ -908,14 +911,14 @@ func (s *SQLite) readToTemp(src *PutObjReader, size int64) (_ io.Reader, done fu
 	return f, doneFunc, nil
 }
 
-func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, metadata map[string]string, opts ObjectOptions) (_ ObjectInfo, err error) {
+func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (_ ObjectInfo, err error) {
 	size := data.Size()
 	err = checkPutObjectArgs(ctx, bucket, object, s, size)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 
-	mdJSON, err := json.Marshal(metadata)
+	mdJSON, err := json.Marshal(opts.UserDefined)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
@@ -1152,14 +1155,14 @@ func bucketExists(conn *sqlite.Conn, bucket string) error {
 	return nil
 }
 
-func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, metadata map[string]string, opts ObjectOptions) (_ string, err error) {
+func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (_ string, err error) {
 	err = checkNewMultipartArgs(ctx, bucket, object, s)
 	if err != nil {
 		return "", err
 	}
 
 	id := MustGetUUID()
-	mdJSON, err := json.Marshal(metadata)
+	mdJSON, err := json.Marshal(opts.UserDefined)
 	if err != nil {
 		return "", err
 	}
@@ -1281,7 +1284,7 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 	return PartInfo{PartNumber: partID, ETag: etag}, nil
 }
 
-func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int) (ListPartsInfo, error) {
+func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int, opts ObjectOptions) (ListPartsInfo, error) {
 	err := checkListPartsArgs(ctx, bucket, object, s)
 	if err != nil {
 		return ListPartsInfo{}, err
@@ -1512,10 +1515,10 @@ func (s *SQLite) ReloadFormat(ctx context.Context, dryRun bool) error {
 func (s *SQLite) HealFormat(ctx context.Context, dryRun bool) (madmin.HealResultItem, error) {
 	return madmin.HealResultItem{}, NotImplemented{}
 }
-func (s *SQLite) HealBucket(ctx context.Context, bucket string, dryRun bool) ([]madmin.HealResultItem, error) {
-	return nil, NotImplemented{}
+func (s *SQLite) HealBucket(ctx context.Context, bucket string, dryRun, remove bool) (madmin.HealResultItem, error) {
+	return madmin.HealResultItem{}, NotImplemented{}
 }
-func (s *SQLite) HealObject(ctx context.Context, bucket, object string, dryRun bool) (madmin.HealResultItem, error) {
+func (s *SQLite) HealObject(ctx context.Context, bucket, object string, dryRun bool, remove bool) (madmin.HealResultItem, error) {
 	return madmin.HealResultItem{}, NotImplemented{}
 }
 func (s *SQLite) ListBucketsHeal(ctx context.Context) ([]BucketInfo, error) {
@@ -1605,5 +1608,6 @@ func (s *SQLite) DeleteBucketPolicy(ctx context.Context, bucket string) error {
 
 // Supported operations check
 func (s *SQLite) IsNotificationSupported() bool { return true }
+func (s *SQLite) IsListenBucketSupported() bool { return true }
 func (s *SQLite) IsEncryptionSupported() bool   { return true }
 func (s *SQLite) IsCompressionSupported() bool  { return true }

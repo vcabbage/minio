@@ -41,8 +41,6 @@ func TestSQLiteLayer(t *testing.T) {
 		testObjectOverwriteWorks,
 		testPaging,
 		testParseStorageClass,
-		testPostPolicyBucketHandler,
-		testPostPolicyBucketHandlerRedirect,
 		testPutObject,
 		testPutObjectInSubdir,
 	}
