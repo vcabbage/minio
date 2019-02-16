@@ -125,7 +125,7 @@ type testDB struct {
 func (db testDB) exec(query string, expected int, f func(*sqlite.Stmt)) {
 	conn, err := db.getConn(context.Background())
 	testCheckErr(db.t, err)
-	defer db.pool.Put(conn)
+	defer db.readers.Put(conn)
 
 	var count int
 	err = sqlitex.Exec(conn, query, func(stmt *sqlite.Stmt) error {
@@ -174,7 +174,7 @@ func newTestDB(t *testing.T) testDB {
 func checkDB(t *testing.T, db *SQLite) {
 	conn, err := db.getConn(context.Background())
 	testCheckErr(t, err)
-	defer db.pool.Put(conn)
+	defer db.readers.Put(conn)
 
 	// NOTE: Some tests are redundant with DB constraints
 	//       but are checked anyway in case the schema is changed.

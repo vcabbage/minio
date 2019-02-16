@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,12 +23,21 @@ import (
 	"github.com/minio/minio/pkg/policy"
 )
 
-// TODO: etags
 // TODO: parse metadata
 
+const (
+	bufferSize        = 16 * 1024 * 1024
+	tempFileThreshold = 16 * 1024 * 1024
+)
+
 type SQLite struct {
-	pool   *sqlitex.Pool
-	closed uint32
+	readers *sqlitex.Pool
+	closed  uint32
+	tempDir string
+
+	mu         sync.Mutex
+	writer     *sqlite.Conn
+	copyBuffer []byte
 }
 
 var (
@@ -36,14 +48,37 @@ func NewSQLiteLayer(uri *url.URL) (ObjectLayer, error) {
 	if uri.Scheme == "sqlite" {
 		uri.Scheme = "file"
 	}
-	const poolSize = 100 // TODO: what size?
-	pool, err := sqlitex.Open(uri.String(), 0, poolSize)
+	file := uri.String()
+	conn, err := sqlite.OpenConn(file, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set very long busy timeout. The context done channel passed when getting
+	// the connection from the pool should always apply.
+	conn.SetBusyTimeout(5 * time.Minute)
+	err = sqlitex.ExecTransient(conn, "PRAGMA foreign_keys = ON;", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	const poolSize = 10 // TODO: what size?
+	const roFlags = sqlite.SQLITE_OPEN_READONLY | sqlite.SQLITE_OPEN_URI | sqlite.SQLITE_OPEN_NOMUTEX
+	pool, err := sqlitex.Open(file, roFlags, poolSize)
+	if err != nil {
+		return nil, err
+	}
+
+	tempDir, err := ioutil.TempDir("", ".minio_sqlite")
 	if err != nil {
 		return nil, err
 	}
 
 	s := &SQLite{
-		pool: pool,
+		tempDir:    tempDir,
+		readers:    pool,
+		writer:     conn,
+		copyBuffer: make([]byte, bufferSize),
 	}
 
 	err = s.init()
@@ -112,18 +147,12 @@ func columnTime(stmt *sqlite.Stmt, col int) time.Time {
 func (s *SQLite) init() error {
 	ctx := context.Background()
 
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.pool.Put(conn)
-
-	err = sqlitex.ExecScript(conn, sqlInit)
+	err := sqlitex.ExecScript(s.writer, sqlInit)
 	if err != nil {
 		return err
 	}
 
-	err = bucketExists(conn, minioMetaBucket)
+	err = bucketExists(s.writer, minioMetaBucket)
 	if err == nil {
 		return nil
 	}
@@ -133,7 +162,19 @@ func (s *SQLite) init() error {
 
 func (s *SQLite) Shutdown(context.Context) error {
 	atomic.StoreUint32(&s.closed, 1)
-	return s.pool.Close()
+	// TODO: synchronize with in progress operations
+	err1 := s.readers.Close()
+	err2 := s.writer.Close()
+	err3 := os.RemoveAll(s.tempDir)
+
+	err := err1
+	if err1 == nil {
+		err = err2
+	}
+	if err2 == nil {
+		err = err3
+	}
+	return err
 }
 
 func (s *SQLite) StorageInfo(ctx context.Context) StorageInfo {
@@ -151,27 +192,22 @@ func (s *SQLite) dbSize(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer s.pool.Put(conn)
+	defer s.readers.Put(conn)
 
 	return sqlitex.ResultInt64(conn.Prep("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size();"))
 }
 
 func (s *SQLite) getConn(ctx context.Context) (*sqlite.Conn, error) {
-	conn := s.pool.Get(ctx)
+	conn := s.readers.Get(ctx)
 	if conn == nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		return nil, errDBClosed // TODO: minio error
 	}
-	// Set very long busy timeout. The context done channel passed when getting
+	// Set very long busy timeout. The context passed when getting
 	// the connection from the pool should always apply.
 	conn.SetBusyTimeout(5 * time.Minute)
-
-	err := sqlitex.ExecTransient(conn, "PRAGMA foreign_keys = ON;", nil)
-	if err != nil {
-		return nil, err
-	}
 
 	return conn, nil
 }
@@ -212,18 +248,16 @@ func (s *SQLite) MakeBucketWithLocation(ctx context.Context, bucket string, loca
 		return BucketNameInvalid{Bucket: bucket}
 	}
 
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.pool.Put(conn)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writer.SetInterrupt(ctx.Done())
 
-	err = bucketExists(conn, bucket)
+	err := bucketExists(s.writer, bucket)
 	if err == nil {
 		return BucketExists{Bucket: bucket}
 	}
 
-	stmt := conn.Prep("INSERT INTO buckets (bucket, created) VALUES (?, ?);")
+	stmt := s.writer.Prep("INSERT INTO buckets (bucket, created) VALUES (?, ?);")
 	stmt.BindText(1, bucket)
 	stmt.BindInt64(2, time.Now().UnixNano())
 	_, err = stmt.Step()
@@ -235,7 +269,7 @@ func (s *SQLite) GetBucketInfo(ctx context.Context, bucket string) (BucketInfo, 
 	if err != nil {
 		return BucketInfo{}, err
 	}
-	defer s.pool.Put(conn)
+	defer s.readers.Put(conn)
 
 	stmt := conn.Prep("SELECT created FROM buckets WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
@@ -265,7 +299,7 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer s.pool.Put(conn)
+	defer s.readers.Put(conn)
 
 	stmt := conn.Prep("SELECT bucket, created FROM buckets;")
 
@@ -295,13 +329,11 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 }
 
 func (s *SQLite) DeleteBucket(ctx context.Context, bucket string) (err error) {
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.pool.Put(conn)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writer.SetInterrupt(ctx.Done())
 
-	stmt := conn.Prep("DELETE FROM buckets WHERE bucket = ?;")
+	stmt := s.writer.Prep("DELETE FROM buckets WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
 	_, err = stmt.Step()
 	return toMinioError(err, errSourceBuckets, bucket)
@@ -324,7 +356,7 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 	if err != nil {
 		return ListObjectsInfo{}, err
 	}
-	defer s.pool.Put(conn)
+	defer s.readers.Put(conn)
 
 	// TODO: all fields
 	// TODO: is "object > marker" adequate?
@@ -437,11 +469,11 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 	connInUse := false
 	defer func() {
 		if !connInUse {
-			s.pool.Put(conn)
+			s.readers.Put(conn)
 		}
 	}()
 
-	stmt := conn.Prep("SELECT object, blob_id, modified, size, metadata FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
+	stmt := conn.Prep("SELECT object, blob_id, modified, size, metadata, etag FROM objects WHERE bucket = ? AND object LIKE ? || '%' ORDER BY object LIMIT 1;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 
@@ -451,6 +483,7 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		modified time.Time
 		size     int64
 		metadata map[string]string
+		etag     string
 	)
 	for {
 		hasRow, err := stmt.Step()
@@ -469,6 +502,7 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		if err != nil {
 			return nil, err
 		}
+		etag = stmt.ColumnText(5)
 	}
 
 	switch {
@@ -492,6 +526,7 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 			Name:    object,
 			ModTime: modified,
 			Size:    size,
+			ETag:    etag,
 		}
 
 		stmt := conn.Prep("SELECT rowid FROM blobs WHERE id = ? ORDER BY part_id;")
@@ -534,7 +569,7 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 			for _, b := range blobs {
 				b.Close()
 			}
-			s.pool.Put(conn)
+			s.readers.Put(conn)
 		}
 		return NewGetObjectReaderFromReader(rdr, info, closer), nil
 
@@ -567,7 +602,7 @@ func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffs
 	if err != nil {
 		return err
 	}
-	defer s.pool.Put(conn)
+	defer s.readers.Put(conn)
 
 	// Check if directory.
 	if hasSuffix(object, slashSeparator) {
@@ -747,7 +782,7 @@ func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts 
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	defer s.pool.Put(conn)
+	defer s.readers.Put(conn)
 
 	// TODO: run all multiquery in transaction?
 	err = bucketExists(conn, bucket)
@@ -818,6 +853,7 @@ func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts 
 		}
 	}
 }
+
 func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, metadata map[string]string, opts ObjectOptions) (_ ObjectInfo, err error) {
 	size := data.Size()
 	err = checkPutObjectArgs(ctx, bucket, object, s, size)
@@ -830,48 +866,74 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *Put
 		return ObjectInfo{}, err
 	}
 
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return ObjectInfo{}, err
+	var (
+		src io.Reader
+		n   int64
+	)
+	if size > tempFileThreshold {
+		f, err := ioutil.TempFile(s.tempDir, "")
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		defer f.Close()
+		defer os.Remove(f.Name())
+
+		n, err = io.Copy(f, data)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		if n < size {
+			return ObjectInfo{}, IncompleteBody{}
+		}
+		_, err = f.Seek(0, 0)
+		if err != nil {
+			return ObjectInfo{}, err
+		}
+		src = f
+	} else {
+		b := make([]byte, size)
+		_, err = io.ReadFull(data, b)
+		if err != nil {
+			if err == io.ErrUnexpectedEOF {
+				err = IncompleteBody{}
+			}
+			return ObjectInfo{}, err
+		}
+		src = bytes.NewReader(b)
 	}
-	defer s.pool.Put(conn)
 
-	// TODO: why does putting this inside the savepoint induce SQLITE_BUSY errors?
-	err = bucketExists(conn, bucket)
-	if err != nil {
-		return ObjectInfo{}, err
-	}
+	// TODO: apply to copy object
+	// TODO: ensure multipart checks mime
+	etag := data.MD5CurrentHexString()
+	contentType := mimedb.TypeByExtension(path.Ext(object))
 
-	defer sqlitex.Save(conn)(&err)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writer.SetInterrupt(ctx.Done())
 
-	stmt := conn.Prep("INSERT INTO blobs (id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), ?);")
+	defer sqlitex.Save(s.writer)(&err)
+
+	stmt := s.writer.Prep("INSERT INTO blobs (id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), ?);")
 	stmt.BindZeroBlob(1, size)
 	_, err = stmt.Step()
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 
-	rowID := conn.LastInsertRowID()
-	blob, err := conn.OpenBlob("", "blobs", "data", rowID, true)
+	rowID := s.writer.LastInsertRowID()
+	blob, err := s.writer.OpenBlob("", "blobs", "data", rowID, true)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 
-	n, err := io.Copy(blob, data)
+	_, err = io.CopyBuffer(blob, src, s.copyBuffer)
 	blob.Close()
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	if n < size {
-		return ObjectInfo{}, IncompleteBody{}
-	}
-
-	// TODO: apply to copy object
-	etag := data.MD5CurrentHexString()
-	contentType := mimedb.TypeByExtension(path.Ext(object))
 
 	// TODO: handle removal of previous blob
-	stmt = conn.Prep(`
+	stmt = s.writer.Prep(`
 		INSERT INTO objects (bucket, object, size, metadata, modified, blob_id, etag, content_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (bucket, object) DO UPDATE SET size=excluded.size, metadata=excluded.metadata, modified=excluded.modified, blob_id=excluded.blob_id, etag=excluded.etag;`)
 	stmt.BindText(1, bucket)
@@ -896,13 +958,11 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *Put
 func (s *SQLite) CopyObject(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (ObjectInfo, error) {
 	// TODO: metadata only update
 
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return ObjectInfo{}, err
-	}
-	defer s.pool.Put(conn)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writer.SetInterrupt(ctx.Done())
 
-	stmt := conn.Prep(`
+	stmt := s.writer.Prep(`
 	INSERT INTO objects(bucket, object, metadata, size, blob_id, modified)
 	SELECT ?, ?, metadata, size, blob_id, ? FROM objects WHERE bucket = ? AND object = ?
 	ON CONFLICT (bucket, object) DO UPDATE SET metadata = excluded.metadata, size = excluded.size, blob_id = excluded.blob_id, modified = excluded.modified;`)
@@ -911,7 +971,7 @@ func (s *SQLite) CopyObject(ctx context.Context, srcBucket, srcObject, destBucke
 	stmt.BindInt64(3, time.Now().UnixNano())
 	stmt.BindText(4, srcBucket)
 	stmt.BindText(5, srcObject)
-	_, err = stmt.Step()
+	_, err := stmt.Step()
 	if err != nil {
 		return ObjectInfo{}, err
 	}
@@ -922,20 +982,18 @@ func (s *SQLite) CopyObject(ctx context.Context, srcBucket, srcObject, destBucke
 	}, nil
 }
 func (s *SQLite) DeleteObject(ctx context.Context, bucket, object string) (err error) {
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return nil
-	}
-	defer s.pool.Put(conn)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writer.SetInterrupt(ctx.Done())
 
-	sqlitex.Save(conn)(&err)
+	defer sqlitex.Save(s.writer)(&err)
 
-	err = bucketExists(conn, bucket)
+	err = bucketExists(s.writer, bucket)
 	if err != nil {
 		return err
 	}
 
-	stmt := conn.Prep("DELETE FROM objects WHERE bucket = ? AND object = ?;")
+	stmt := s.writer.Prep("DELETE FROM objects WHERE bucket = ? AND object = ?;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 	_, err = stmt.Step()
@@ -943,7 +1001,7 @@ func (s *SQLite) DeleteObject(ctx context.Context, bucket, object string) (err e
 		return err
 	}
 
-	if conn.Changes() == 0 {
+	if s.writer.Changes() == 0 {
 		return ObjectNotFound{
 			Bucket: bucket,
 			Object: object,
@@ -973,9 +1031,9 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 	if err != nil {
 		return res, err
 	}
-	defer s.pool.Put(conn)
+	defer s.readers.Put(conn)
 
-	sqlitex.Save(conn)(&err)
+	defer sqlitex.Save(conn)(&err)
 
 	err = bucketExists(conn, bucket)
 	if err != nil {
@@ -1081,23 +1139,21 @@ func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, 
 		return "", err
 	}
 
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return "", err
-	}
-	defer s.pool.Put(conn)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writer.SetInterrupt(ctx.Done())
 
-	sqlitex.Save(conn)(&err)
+	defer sqlitex.Save(s.writer)(&err)
 
 	// reserve a blob_id
-	stmt := conn.Prep("INSERT INTO blobs (id, part_id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), -1, 0);")
+	stmt := s.writer.Prep("INSERT INTO blobs (id, part_id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), -1, 0);")
 	_, err = stmt.Step()
 	if err != nil {
 		return "", err
 	}
-	rowID := conn.LastInsertRowID()
+	rowID := s.writer.LastInsertRowID()
 
-	stmt = conn.Prep("INSERT INTO uploads (id, bucket, object, metadata, blob_id) VALUES (?, ?, ?, ?, (SELECT id FROM blobs WHERE rowid = ?))")
+	stmt = s.writer.Prep("INSERT INTO uploads (id, bucket, object, metadata, blob_id) VALUES (?, ?, ?, ?, (SELECT id FROM blobs WHERE rowid = ?))")
 	stmt.BindText(1, id)
 	stmt.BindText(2, bucket)
 	stmt.BindText(3, object)
@@ -1146,30 +1202,59 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 		return PartInfo{}, err
 	}
 
-	conn, err := s.getConn(ctx)
+	size := data.Size()
+
+	var src io.Reader
+	if size > tempFileThreshold {
+		f, err := ioutil.TempFile(s.tempDir, "")
+		if err != nil {
+			return PartInfo{}, err
+		}
+		defer f.Close()
+		defer os.Remove(f.Name())
+
+		_, err = io.Copy(f, data)
+		if err != nil {
+			return PartInfo{}, err
+		}
+		_, err = f.Seek(0, 0)
+		if err != nil {
+			return PartInfo{}, err
+		}
+		src = f
+	} else {
+		b, err := ioutil.ReadAll(data)
+		if err != nil {
+			return PartInfo{}, err
+		}
+		src = bytes.NewReader(b)
+	}
+
+	etag := data.MD5CurrentHexString()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writer.SetInterrupt(ctx.Done())
+
+	defer sqlitex.Save(s.writer)(&err)
+
+	blobID, err := getBlobID(s.writer, bucket, object, uploadID)
 	if err != nil {
 		return PartInfo{}, err
 	}
-	defer s.pool.Put(conn)
 
-	sqlitex.Save(conn)(&err)
-
-	blobID, err := getBlobID(conn, bucket, object, uploadID)
-	if err != nil {
-		return PartInfo{}, err
-	}
-
-	stmt := conn.Prep("INSERT INTO blobs (id, part_id, data) VALUES (?, ?, ?) ON CONFLICT (id, part_id) DO UPDATE SET data = excluded.data;")
+	stmt := s.writer.Prep("INSERT INTO blobs (id, part_id, data, etag) VALUES (?, ?, ?, ?) ON CONFLICT (id, part_id) DO UPDATE SET data = excluded.data;")
 	stmt.BindInt64(1, blobID)
 	stmt.BindInt64(2, int64(partID))
-	stmt.BindZeroBlob(3, data.Size())
+	stmt.BindZeroBlob(3, size)
+	stmt.BindText(4, etag)
 	_, err = stmt.Step()
 	if err != nil {
 		return PartInfo{}, err
 	}
 
 	// must query rowid since last insert will be incorrect on upsert
-	stmt = conn.Prep("SELECT rowid FROM blobs WHERE id = ? AND part_id = ?")
+	stmt = s.writer.Prep("SELECT rowid FROM blobs WHERE id = ? AND part_id = ?")
 	stmt.BindInt64(1, blobID)
 	stmt.BindInt64(2, int64(partID))
 	rowID, err := sqlitex.ResultInt64(stmt)
@@ -1177,23 +1262,13 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 		return PartInfo{}, err
 	}
 
-	blob, err := conn.OpenBlob("", "blobs", "data", rowID, true)
+	blob, err := s.writer.OpenBlob("", "blobs", "data", rowID, true)
 	if err != nil {
 		return PartInfo{}, err
 	}
 	defer blob.Close()
 
-	_, err = io.Copy(blob, data)
-	if err != nil {
-		return PartInfo{}, err
-	}
-
-	etag := data.MD5CurrentHexString()
-
-	stmt = conn.Prep("UPDATE blobs SET etag = ? WHERE rowid = ?")
-	stmt.BindText(1, etag)
-	stmt.BindInt64(2, rowID)
-	_, err = stmt.Step()
+	_, err = io.CopyBuffer(blob, src, s.copyBuffer)
 	if err != nil {
 		return PartInfo{}, err
 	}
@@ -1221,7 +1296,7 @@ func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID s
 	if err != nil {
 		return res, err
 	}
-	defer s.pool.Put(conn)
+	defer s.readers.Put(conn)
 
 	blobID, err := getBlobID(conn, bucket, object, uploadID)
 	if err != nil {
@@ -1275,32 +1350,30 @@ func (s *SQLite) AbortMultipartUpload(ctx context.Context, bucket, object, uploa
 		return err
 	}
 
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.pool.Put(conn)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writer.SetInterrupt(ctx.Done())
 
-	sqlitex.Save(conn)(&err)
+	defer sqlitex.Save(s.writer)(&err)
 
-	err = bucketExists(conn, bucket)
-	if err != nil {
-		return err
-	}
-
-	blobID, err := getBlobID(conn, bucket, object, uploadID)
+	err = bucketExists(s.writer, bucket)
 	if err != nil {
 		return err
 	}
 
-	stmt := conn.Prep("DELETE FROM uploads WHERE id = ?;")
+	blobID, err := getBlobID(s.writer, bucket, object, uploadID)
+	if err != nil {
+		return err
+	}
+
+	stmt := s.writer.Prep("DELETE FROM uploads WHERE id = ?;")
 	stmt.BindText(1, uploadID)
 	_, err = stmt.Step()
 	if err != nil {
 		return toMinioError(err, errSourceUploads, uploadID)
 	}
 
-	stmt = conn.Prep("DELETE FROM blobs WHERE id = ?;")
+	stmt = s.writer.Prep("DELETE FROM blobs WHERE id = ?;")
 	stmt.BindInt64(1, blobID)
 	_, err = stmt.Step()
 	return toMinioError(err, errSourceUploads, uploadID)
@@ -1318,21 +1391,19 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 		return ObjectInfo{}, err
 	}
 
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return ObjectInfo{}, err
-	}
-	defer s.pool.Put(conn)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writer.SetInterrupt(ctx.Done())
 
-	defer sqlitex.Save(conn)(&err)
+	defer sqlitex.Save(s.writer)(&err)
 
-	blobID, err := getBlobID(conn, bucket, object, uploadID)
+	blobID, err := getBlobID(s.writer, bucket, object, uploadID)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 
 	// get existing parts
-	stmt := conn.Prep("SELECT part_id, etag, length(data) FROM blobs WHERE id = ? ORDER BY part_id;")
+	stmt := s.writer.Prep("SELECT part_id, etag, length(data) FROM blobs WHERE id = ? ORDER BY part_id;")
 	if err != nil {
 		return ObjectInfo{}, err
 	}
@@ -1380,7 +1451,7 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 
 	// remove any extraneous parts, including marker part_id of -1
 	for partID := range dbPartIDs {
-		stmt = conn.Prep("DELETE FROM blobs WHERE id = ? AND part_id = ?;")
+		stmt = s.writer.Prep("DELETE FROM blobs WHERE id = ? AND part_id = ?;")
 		stmt.BindInt64(1, blobID)
 		stmt.BindInt64(2, int64(partID))
 		_, err = stmt.Step()
@@ -1390,7 +1461,7 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	}
 
 	// create object
-	stmt = conn.Prep(`
+	stmt = s.writer.Prep(`
 		INSERT INTO objects (bucket, object, size, metadata, modified, blob_id, etag, content_type) VALUES (
 			?1,
 			?2,
@@ -1415,7 +1486,7 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	}
 
 	// remove upload
-	stmt = conn.Prep("DELETE FROM uploads WHERE id = ?;")
+	stmt = s.writer.Prep("DELETE FROM uploads WHERE id = ?;")
 	stmt.BindText(1, uploadID)
 	_, err = stmt.Step()
 	if err != nil {
@@ -1456,13 +1527,11 @@ func (s *SQLite) SetBucketPolicy(ctx context.Context, bucket string, policy *pol
 		return err
 	}
 
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.pool.Put(conn)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writer.SetInterrupt(ctx.Done())
 
-	stmt := conn.Prep("UPDATE buckets SET policy = ? WHERE bucket = ?;")
+	stmt := s.writer.Prep("UPDATE buckets SET policy = ? WHERE bucket = ?;")
 	stmt.BindBytes(1, policyJSON)
 	stmt.BindText(2, bucket)
 	_, err = stmt.Step()
@@ -1470,7 +1539,7 @@ func (s *SQLite) SetBucketPolicy(ctx context.Context, bucket string, policy *pol
 		return toMinioError(err, errSourceBuckets, bucket)
 	}
 
-	if conn.Changes() == 0 {
+	if s.writer.Changes() == 0 {
 		return BucketNotFound{Bucket: bucket}
 	}
 
@@ -1482,7 +1551,7 @@ func (s *SQLite) GetBucketPolicy(ctx context.Context, bucket string) (*policy.Po
 	if err != nil {
 		return nil, err
 	}
-	defer s.pool.Put(conn)
+	defer s.readers.Put(conn)
 
 	stmt := conn.Prep("SELECT rowid, policy IS NOT NULL FROM buckets WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
@@ -1518,15 +1587,13 @@ func (s *SQLite) GetBucketPolicy(ctx context.Context, bucket string) (*policy.Po
 }
 
 func (s *SQLite) DeleteBucketPolicy(ctx context.Context, bucket string) error {
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.pool.Put(conn)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writer.SetInterrupt(ctx.Done())
 
-	stmt := conn.Prep("UPDATE buckets SET policy = NULL WHERE bucket = ?;")
+	stmt := s.writer.Prep("UPDATE buckets SET policy = NULL WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
-	_, err = stmt.Step()
+	_, err := stmt.Step()
 
 	return err
 }
