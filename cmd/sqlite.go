@@ -385,20 +385,39 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 
 	var stmt *sqlite.Stmt
 	if delimiter == "" {
-		stmt = conn.Prep("SELECT object as name, size, modified, etag FROM objects WHERE bucket = ? AND instr(object, ?) = 1 AND object > ? ORDER BY object LIMIT ?;")
+		stmt = conn.Prep(`
+			SELECT object as name, size, modified, etag FROM objects
+			WHERE
+				bucket = ? AND
+				instr(object, ?) = 1 AND
+				object > ?
+			ORDER BY object LIMIT ?;`)
 		stmt.BindText(1, bucket)
 		stmt.BindText(2, prefix)
 		stmt.BindText(3, marker)
 		stmt.BindInt64(4, int64(maxKeys)+1)
 	} else {
 		stmt = conn.Prep(`
-		SELECT DISTINCT $prefix || substr(ltrim(object, $prefix), 1, instr(ltrim(object, $prefix), $delimiter)) as name, 0 as size, 0 as modified, '' as etag, 1 as is_prefix
+		SELECT DISTINCT
+			substr(object, 1, length($prefix) + instr(substr(object, length($prefix)+1), $delimiter)) as name,
+			0 as size,
+			0 as modified,
+			'' as etag,
+			1 as is_prefix
 		FROM objects
-		WHERE bucket = $bucket AND instr(object, $prefix) = 1 AND object > $marker AND name <> $prefix
+		WHERE
+			bucket = $bucket AND
+			instr(object, $prefix) = 1 AND
+			object > $marker AND
+			name <> $prefix
 		UNION
 		SELECT object as name, size, modified, etag, 0 as is_prefix
 		FROM objects
-		WHERE bucket = $bucket AND instr(object, $prefix) = 1 AND object > $marker AND instr(ltrim(object, $prefix), $delimiter) = 0
+		WHERE
+			bucket = $bucket AND
+			instr(object, $prefix) = 1 AND
+			object > $marker AND
+			instr(substr(object, length($prefix)+1), $delimiter) = 0
 		ORDER BY object
 		LIMIT $max_keys;`)
 		stmt.SetText("$bucket", bucket)
@@ -984,7 +1003,14 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 
 	var stmt *sqlite.Stmt
 	if delimiter == "" {
-		stmt = conn.Prep("SELECT id, object as name, initiated FROM uploads WHERE bucket = ? AND instr(object, ?) = 1 AND object > ? AND id > ? ORDER BY object LIMIT ?;")
+		stmt = conn.Prep(`
+			SELECT id, object as name, initiated FROM uploads
+			WHERE
+				bucket = ? AND
+				instr(object, ?) = 1 AND
+				object > ? AND
+				id > ?
+			ORDER BY object LIMIT ?;`)
 		stmt.BindText(1, bucket)
 		stmt.BindText(2, prefix)
 		stmt.BindText(3, keyMarker)
@@ -992,13 +1018,27 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 		stmt.BindInt64(5, int64(maxUploads)+1)
 	} else {
 		stmt = conn.Prep(`
-		SELECT DISTINCT id, $prefix || substr(ltrim(object, $prefix), 1, instr(ltrim(object, $prefix), $delimiter)) as name, 0 as initiated, 1 as is_prefix
+		SELECT DISTINCT
+			id,
+			substr(object, 1, length($prefix) + instr(substr(object, length($prefix)+1), $delimiter)) as name,
+			0 as initiated,
+			1 as is_prefix
 		FROM uploads
-		WHERE bucket = $bucket AND instr(object, ?) = 1 AND object > $key_marker AND id > $id_marker AND name <> $prefix
+		WHERE
+			bucket = $bucket AND
+			instr(object, $prefix) = 1 AND
+			object > $key_marker AND
+			id > $id_marker AND
+			name <> $prefix
 		UNION
 		SELECT id, object as name, initiated, 0 as is_prefix
 		FROM uploads
-		WHERE bucket = $bucket AND instr(object, ?) = 1 AND object > $key_marker AND id > $id_marker AND instr(ltrim(object, $prefix), $delimiter) = 0
+		WHERE
+			bucket = $bucket AND
+			instr(object, $prefix) = 1
+			AND object > $key_marker
+			AND id > $id_marker
+			AND instr(substr(object, length($prefix)+1), $delimiter) = 0
 		ORDER BY object
 		LIMIT $max_keys;`)
 		stmt.SetText("$bucket", bucket)
@@ -1018,8 +1058,8 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 		}
 
 		mi := MultipartInfo{
-			Object:    stmt.ColumnText(0),
-			UploadID:  stmt.ColumnText(1),
+			UploadID:  stmt.ColumnText(0),
+			Object:    stmt.ColumnText(1),
 			Initiated: columnTime(stmt, 2),
 		}
 		res.NextKeyMarker = mi.Object
