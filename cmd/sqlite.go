@@ -24,7 +24,6 @@ import (
 
 // TODO: add error logging
 // TODO: support WORM mode
-// TODO: DB schema migration system
 
 const (
 	sqliteBufferSize        = 16 * 1024 * 1024
@@ -42,20 +41,29 @@ const (
 // https://www.sqlite.org/withoutrowid.html
 //
 // Timestamps are stored as nanoseconds since unix epoch.
-const sqlInit = `
-	CREATE TABLE IF NOT EXISTS buckets (
+//
+// Migrations are applied in order. To adjust the schema
+// add another script to the slice. Do not remove or reorder
+// scripts.
+var sqliteMigrations = []string{
+	`
+	CREATE TABLE internal (
+		key    TEXT PRIMARY KEY NOT NULL,
+		value  NONE NOT NULL
+	);
+	CREATE TABLE buckets (
 		bucket   TEXT    PRIMARY KEY NOT NULL,
 		policy   BLOB,
 		created  INTEGER NOT NULL
 	);
-	CREATE TABLE IF NOT EXISTS blobs (
+	CREATE TABLE blobs (
 		id       INTEGER NOT NULL,
 		part_id  INTEGER NOT NULL DEFAULT 0,
 		etag     TEXT,
 		data     BLOB    NOT NULL,
 		PRIMARY KEY (id, part_id)
 	);
-	CREATE TABLE IF NOT EXISTS objects (
+	CREATE TABLE objects (
 		bucket        TEXT    REFERENCES buckets ON DELETE RESTRICT ON UPDATE CASCADE,
 		object        TEXT    NOT NULL,
 		metadata      TEXT    NOT NULL,
@@ -66,7 +74,7 @@ const sqlInit = `
 		content_type  TEXT    NOT NULL,
 		PRIMARY KEY (bucket, object)
 	) WITHOUT ROWID;
-	CREATE TABLE IF NOT EXISTS uploads (
+	CREATE TABLE uploads (
 		id         TEXT    PRIMARY KEY NOT NULL,
 		bucket     TEXT    REFERENCES buckets ON DELETE CASCADE ON UPDATE CASCADE,
 		object     TEXT    NOT NULL,
@@ -74,18 +82,19 @@ const sqlInit = `
 		initiated  INTEGER NOT NULL,
 		blob_id    INTEGER NOT NULL
 	);
-	CREATE TRIGGER IF NOT EXISTS remove_object AFTER DELETE ON objects
+	CREATE TRIGGER remove_object AFTER DELETE ON objects
 	BEGIN
 		DELETE FROM blobs WHERE id = OLD.blob_id AND NOT EXISTS (SELECT 1 FROM objects WHERE blob_id = OLD.blob_id);
 	END;
-	CREATE TRIGGER IF NOT EXISTS update_object AFTER UPDATE OF blob_id ON objects
+	CREATE TRIGGER update_object AFTER UPDATE OF blob_id ON objects
 	BEGIN
 		DELETE FROM blobs WHERE id = OLD.blob_id AND NOT EXISTS (SELECT 1 FROM objects WHERE blob_id = OLD.blob_id);
 	END;
-	CREATE TRIGGER IF NOT EXISTS remove_upload AFTER DELETE ON uploads
+	CREATE TRIGGER remove_upload AFTER DELETE ON uploads
 	BEGIN
 		DELETE FROM blobs WHERE id = OLD.blob_id AND NOT EXISTS (SELECT 1 FROM objects WHERE blob_id = OLD.blob_id);
-	END;`
+	END;`,
+}
 
 type SQLite struct {
 	// Object PUTs larger than sqliteTempFileThreshold are stored
@@ -157,9 +166,50 @@ func sqliteInitConn(conn *sqlite.Conn) {
 	conn.SetBusyTimeout(5 * time.Minute)
 }
 
-func (s *SQLite) init() error {
-	// Initialize the database.
-	err := sqlitex.ExecScript(s.writer, sqlInit)
+func (s *SQLite) init() (err error) {
+	// Start a savepoint to ensure migrations are applied atomically.
+	defer sqlitex.Save(s.writer)(&err)
+
+	// Check if this is a new database or not.
+	stmt, _, err := s.writer.PrepareTransient("SELECT value FROM internal WHERE key = 'schema_version';")
+	noVersion := err != nil && strings.Contains(err.Error(), "no such table")
+	if err != nil && !noVersion {
+		return err
+	}
+
+	// If internal table exists, retrieve schema version.
+	migrationStart := 0
+	if !noVersion {
+		_, err = sqliteExecResults(stmt, func() error {
+			migrationStart = stmt.ColumnInt(0)
+			return nil
+		})
+		stmt.Finalize()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Execute migration necessary scripts.
+	for _, migration := range sqliteMigrations[migrationStart:] {
+		err := sqlitex.ExecScript(s.writer, migration)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Update schema version.
+	stmt, _, err = s.writer.PrepareTransient(`
+		INSERT INTO internal(key, value)
+		VALUES ('schema_version', ?)
+		ON CONFLICT (key) DO UPDATE
+		SET value = EXCLUDED.value;`)
+	stmt.BindInt64(1, int64(len(sqliteMigrations)))
+	if err != nil {
+		return err
+	}
+	err = sqliteExec(stmt)
+	stmt.Finalize()
 	if err != nil {
 		return err
 	}
