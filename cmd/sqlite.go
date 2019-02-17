@@ -225,18 +225,6 @@ func (s *SQLite) getConn(ctx context.Context) (*sqlite.Conn, error) {
 	return conn, nil
 }
 
-func sqliteToMinioError(err error) error {
-	if err, ok := err.(sqlite.Error); ok {
-		switch err.Code {
-		case sqlite.SQLITE_FULL:
-			return StorageFull{}
-		case sqlite.SQLITE_BUSY:
-			return OperationTimedOut{}
-		}
-	}
-	return err
-}
-
 // Bucket operations.
 func (s *SQLite) MakeBucketWithLocation(ctx context.Context, bucket string, location string) error {
 	if !IsValidBucketName(bucket) {
@@ -255,8 +243,7 @@ func (s *SQLite) MakeBucketWithLocation(ctx context.Context, bucket string, loca
 	stmt := s.writer.Prep("INSERT INTO buckets (bucket, created) VALUES (?, ?);")
 	stmt.BindText(1, bucket)
 	stmt.BindInt64(2, time.Now().UnixNano())
-	_, err = stmt.Step()
-	return sqliteToMinioError(err)
+	return sqliteExec(stmt)
 }
 
 func (s *SQLite) GetBucketInfo(ctx context.Context, bucket string) (BucketInfo, error) {
@@ -270,19 +257,15 @@ func (s *SQLite) GetBucketInfo(ctx context.Context, bucket string) (BucketInfo, 
 	stmt.BindText(1, bucket)
 
 	bi := BucketInfo{Name: bucket}
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return bi, err
-		}
-		if !hasRow {
-			break
-		}
-
+	rows, err := sqliteExecResults(stmt, func() error {
 		bi.Created = columnTime(stmt, 0)
+		return nil
+	})
+	if err != nil {
+		return bi, err
 	}
 
-	if bi.Created.IsZero() {
+	if rows == 0 {
 		return bi, BucketNotFound{Bucket: bucket}
 	}
 
@@ -299,28 +282,21 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 	stmt := conn.Prep("SELECT bucket, created FROM buckets;")
 
 	var buckets []BucketInfo
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return nil, err
-		}
-		if !hasRow {
-			break
-		}
-
+	_, err = sqliteExecResults(stmt, func() error {
 		b := BucketInfo{
 			Name:    stmt.ColumnText(0),
 			Created: columnTime(stmt, 1),
 		}
 
 		if isMinioMetaBucketName(b.Name) {
-			continue
+			return nil
 		}
 
 		buckets = append(buckets, b)
-	}
+		return nil
+	})
 
-	return buckets, nil
+	return buckets, err
 }
 
 func (s *SQLite) DeleteBucket(ctx context.Context, bucket string) (err error) {
@@ -330,11 +306,12 @@ func (s *SQLite) DeleteBucket(ctx context.Context, bucket string) (err error) {
 
 	stmt := s.writer.Prep("DELETE FROM buckets WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
-	_, err = stmt.Step()
+
+	err = sqliteExec(stmt)
 	if sqlite.ErrCode(err) == sqlite.SQLITE_CONSTRAINT_TRIGGER {
 		return BucketNotEmpty{Bucket: bucket}
 	}
-	return sqliteToMinioError(err)
+	return err
 }
 
 func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (ListObjectsInfo, error) {
@@ -381,43 +358,36 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 		stmt.SetInt64("$max_keys", int64(maxKeys)+1)
 	}
 
-	var objects ListObjectsInfo
 	var count int
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return objects, sqliteToMinioError(err)
-		}
-		if !hasRow {
-			break
-		}
-
+	var objects ListObjectsInfo
+	_, err = sqliteExecResults(stmt, func() error {
 		count++
 		if count > maxKeys {
 			objects.IsTruncated = true
-			continue
+			return nil
 		}
 
-		var (
-			name     = stmt.GetText("name")
-			size     = stmt.GetInt64("size")
-			modified = time.Unix(0, stmt.GetInt64("modified"))
-			etag     = stmt.GetText("etag")
-			isPrefix = stmt.GetInt64("is_prefix") == 1 // TODO: this isn't set when no delimiter
-		)
+		name := stmt.ColumnText(0)
 		objects.NextMarker = name
-		if isPrefix {
+		if delimiter != "" && stmt.ColumnInt64(4) == 1 { // is_prefix
 			objects.Prefixes = append(objects.Prefixes, name)
-			continue
+			return nil
 		}
+
 		objects.Objects = append(objects.Objects, ObjectInfo{
 			Bucket:  bucket,
 			Name:    name,
-			Size:    size,
-			ModTime: modified,
-			ETag:    etag,
+			Size:    stmt.ColumnInt64(1),
+			ModTime: columnTime(stmt, 2),
+			ETag:    stmt.ColumnText(3),
 		})
+
+		return nil
+	})
+	if err != nil {
+		return objects, err
 	}
+
 	if !objects.IsTruncated {
 		objects.NextMarker = ""
 	}
@@ -475,117 +445,99 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 	stmt.BindText(2, object)
 
 	var (
-		name     string
-		blobID   int64
-		modified time.Time
-		size     int64
-		metadata map[string]string
-		etag     string
+		oi     ObjectInfo
+		blobID int64
 	)
-	for {
-		hasRow, err := stmt.Step()
+	n, err := sqliteExecResults(stmt, func() error {
+		oi = ObjectInfo{
+			Name:    stmt.ColumnText(0),
+			ModTime: columnTime(stmt, 2),
+			Size:    stmt.ColumnInt64(3),
+			ETag:    stmt.ColumnText(5),
+		}
+		err := json.NewDecoder(stmt.ColumnReader(4)).Decode(&oi.UserDefined)
 		if err != nil {
-			return nil, sqliteToMinioError(err)
+			return err
 		}
-		if !hasRow {
-			break
-		}
-
-		name = stmt.ColumnText(0)
 		blobID = stmt.ColumnInt64(1)
-		modified = columnTime(stmt, 2)
-		size = stmt.ColumnInt64(3)
-		err = json.NewDecoder(stmt.ColumnReader(4)).Decode(&metadata)
-		if err != nil {
-			return nil, err
-		}
-		etag = stmt.ColumnText(5)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	switch {
-	// object
-	case name == object:
-		startOffset, length, err := rs.GetOffsetLength(size)
-		if err != nil {
-			return nil, err
+	if n == 0 {
+		return nil, ObjectNotFound{
+			Bucket: bucket,
+			Object: object,
 		}
-
-		if startOffset > size || startOffset+length > size {
-			return nil, InvalidRange{
-				OffsetBegin:  startOffset,
-				OffsetEnd:    length,
-				ResourceSize: size,
-			}
-		}
-
-		info := ObjectInfo{
-			Bucket:  bucket,
-			Name:    object,
-			ModTime: modified,
-			Size:    size,
-			ETag:    etag,
-		}
-
-		stmt := conn.Prep("SELECT rowid FROM blobs WHERE id = ? ORDER BY part_id;")
-		stmt.BindInt64(1, blobID)
-
-		var blobs []*sqlite.Blob
-		defer func() {
-			if connInUse {
-				return
-			}
-			for _, blob := range blobs {
-				blob.Close()
-			}
-		}()
-		for {
-			hasRow, err := stmt.Step()
-			if err != nil {
-				return nil, sqliteToMinioError(err)
-			}
-			if !hasRow {
-				break
-			}
-
-			rowID := stmt.ColumnInt64(0)
-			blob, err := conn.OpenBlob("", "blobs", "data", rowID, false)
-			if err != nil {
-				return nil, sqliteToMinioError(err)
-			}
-
-			blobs = append(blobs, blob)
-		}
-
-		rdr, err := newBlobReader(bucket, object, blobs, startOffset, length)
-		if err != nil {
-			return nil, err
-		}
-
-		connInUse = true
-		closer := func() {
-			for _, b := range blobs {
-				b.Close()
-			}
-			s.readers.Put(conn)
-		}
-		return NewGetObjectReaderFromReader(rdr, info, closer), nil
+	}
 
 	// directory
-	case strings.HasSuffix(object, slashSeparator) || strings.HasPrefix(strings.TrimPrefix(name, object), slashSeparator):
+	if strings.HasSuffix(object, slashSeparator) || strings.HasPrefix(strings.TrimPrefix(oi.Name, object), slashSeparator) {
 		info := ObjectInfo{
 			Bucket: bucket,
 			Name:   object,
 			IsDir:  true,
 		}
 		return NewGetObjectReaderFromReader(bytes.NewReader(nil), info, func() {}), nil
+	}
 
-	default:
-		return nil, ObjectNotFound{
-			Bucket: bucket,
-			Object: object,
+	startOffset, length, err := rs.GetOffsetLength(oi.Size)
+	if err != nil {
+		return nil, err
+	}
+
+	if startOffset > oi.Size || startOffset+length > oi.Size {
+		return nil, InvalidRange{
+			OffsetBegin:  startOffset,
+			OffsetEnd:    length,
+			ResourceSize: oi.Size,
 		}
 	}
+
+	var blobs []*sqlite.Blob
+	defer func() {
+		if connInUse {
+			return
+		}
+		for _, blob := range blobs {
+			blob.Close()
+		}
+	}()
+
+	stmt = conn.Prep("SELECT rowid FROM blobs WHERE id = ? ORDER BY part_id;")
+	stmt.BindInt64(1, blobID)
+	_, err = sqliteExecResults(stmt, func() error {
+		rowID := stmt.ColumnInt64(0)
+
+		blob, err := conn.OpenBlob("", "blobs", "data", rowID, false)
+		if err != nil {
+			return err
+		}
+
+		blobs = append(blobs, blob)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	rdr, err := newBlobReader(bucket, object, blobs, startOffset, length)
+	if err != nil {
+		return nil, err
+	}
+
+	connInUse = true
+	closer := func() {
+		for _, b := range blobs {
+			b.Close()
+		}
+		s.readers.Put(conn)
+	}
+	return NewGetObjectReaderFromReader(rdr, oi, closer), nil
 }
+
 func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffset, length int64, writer io.Writer, etag string, opts ObjectOptions) error {
 	err := checkGetObjArgs(ctx, bucket, object)
 	if err != nil {
@@ -606,22 +558,13 @@ func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffs
 		stmt := conn.Prep("SELECT 1 FROM objects WHERE bucket = ? AND instr(object, ?) = 1 LIMIT 1;")
 		stmt.BindText(1, bucket)
 		stmt.BindText(2, object)
-		var exists bool
-		for {
-			hasRow, err := stmt.Step()
-			if err != nil {
-				return sqliteToMinioError(err)
+		_, err = sqliteExecResults(stmt, func() error {
+			if stmt.ColumnInt64(0) != 1 {
+				return ObjectNotFound{Bucket: bucket, Object: object}
 			}
-			if !hasRow {
-				break
-			}
-
-			exists = stmt.ColumnInt64(0) == 1
-		}
-		if !exists {
-			return ObjectNotFound{Bucket: bucket, Object: object}
-		}
-		return nil
+			return nil
+		})
+		return err
 	}
 
 	stmt := conn.Prep("SELECT blob_id, size FROM objects WHERE bucket = ? AND object = ?;")
@@ -632,17 +575,16 @@ func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffs
 		blobID int64
 		size   int64
 	)
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return sqliteToMinioError(err)
-		}
-		if !hasRow {
-			break
-		}
-
+	n, err := sqliteExecResults(stmt, func() error {
 		blobID = stmt.ColumnInt64(0)
 		size = stmt.ColumnInt64(1)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ObjectNotFound{Bucket: bucket, Object: object}
 	}
 
 	// TODO: validate etag
@@ -655,31 +597,28 @@ func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffs
 		}
 	}
 
-	stmt = conn.Prep("SELECT rowid FROM blobs WHERE id = ? ORDER BY part_id;")
-	stmt.BindInt64(1, blobID)
-
 	var blobs []*sqlite.Blob
 	defer func() {
 		for _, blob := range blobs {
 			blob.Close()
 		}
 	}()
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return sqliteToMinioError(err)
-		}
-		if !hasRow {
-			break
-		}
 
+	stmt = conn.Prep("SELECT rowid FROM blobs WHERE id = ? ORDER BY part_id;")
+	stmt.BindInt64(1, blobID)
+
+	_, err = sqliteExecResults(stmt, func() error {
 		rowID := stmt.ColumnInt64(0)
 		blob, err := conn.OpenBlob("", "blobs", "data", rowID, false)
 		if err != nil {
-			return sqliteToMinioError(err)
+			return err
 		}
 
 		blobs = append(blobs, blob)
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	rdr, err := newBlobReader(bucket, object, blobs, startOffset, length)
@@ -689,86 +628,6 @@ func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffs
 
 	_, err = io.Copy(writer, rdr)
 	return err
-}
-
-func newBlobReader(bucket, object string, blobs []*sqlite.Blob, startOffset, length int64) (io.Reader, error) {
-	var r io.Reader
-	switch len(blobs) {
-	// no blobs found
-	case 0:
-		return nil, ObjectNotFound{Bucket: bucket, Object: object}
-
-	// fast path for single blob
-	// TODO: does this really make any difference?
-	case 1:
-		r = blobs[0]
-		if startOffset != 0 {
-			_, err := blobs[0].Seek(startOffset, io.SeekStart)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		if length > -1 {
-			// TODO: check startOffset+length>blob.Size()?
-			r = io.LimitReader(r, length)
-		}
-
-	// multiple blobs
-	default:
-		r = &multiBlobReader{
-			blobs:       blobs,
-			startOffset: startOffset,
-			length:      length,
-		}
-	}
-
-	return r, nil
-}
-
-type multiBlobReader struct {
-	idx         int
-	blobs       []*sqlite.Blob
-	startOffset int64
-	length      int64
-}
-
-func (br *multiBlobReader) Read(p []byte) (int, error) {
-	for {
-		if br.idx >= len(br.blobs) {
-			return 0, io.EOF
-		}
-
-		blob := br.blobs[br.idx]
-		size := blob.Size()
-
-		if br.startOffset > 0 {
-			if br.startOffset >= size {
-				br.startOffset -= size
-				blob.Close()
-				br.idx++
-				continue
-			}
-			_, err := blob.Seek(br.startOffset, io.SeekStart)
-			if err != nil {
-				return 0, err
-			}
-			br.startOffset = 0
-		}
-
-		limit := int64(len(p))
-		if br.length > -1 && limit > br.length {
-			limit = br.length
-		}
-		n, err := blob.Read(p[:limit])
-		br.length -= int64(n)
-		if err == io.EOF && br.length > 0 && len(br.blobs) > 1 {
-			blob.Close()
-			br.idx++
-			err = nil
-		}
-		return n, err
-	}
 }
 
 func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
@@ -793,64 +652,35 @@ func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts 
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 
-	var (
-		name        string
-		size        int64
-		modified    time.Time
-		etag        string
-		contentType string
-		metadata    map[string]string
-	)
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return ObjectInfo{}, sqliteToMinioError(err)
+	var oi ObjectInfo
+	n, err := sqliteExecResults(stmt, func() error {
+		oi = ObjectInfo{
+			Bucket:      bucket,
+			Name:        stmt.ColumnText(0),
+			Size:        stmt.ColumnInt64(1),
+			ModTime:     columnTime(stmt, 2),
+			ETag:        stmt.ColumnText(3),
+			ContentType: stmt.ColumnText(4),
 		}
-		if !hasRow {
-			break
-		}
-
-		name = stmt.ColumnText(0)
-		size = stmt.ColumnInt64(1)
-		modified = columnTime(stmt, 2)
-		etag = stmt.ColumnText(3)
-		contentType = stmt.ColumnText(4)
-		err = json.NewDecoder(stmt.ColumnReader(5)).Decode(&metadata)
-		if err != nil {
-			return ObjectInfo{}, err
-		}
+		return json.NewDecoder(stmt.ColumnReader(5)).Decode(&oi.UserDefined)
+	})
+	if err != nil {
+		return oi, err
+	}
+	if n == 0 {
+		return oi, ObjectNotFound{Bucket: bucket, Object: object}
 	}
 
-	isDir := strings.HasSuffix(object, "/")
-
-	switch {
-	// object
-	case name == object && !isDir:
-		return ObjectInfo{
-			Bucket:      bucket,
-			Name:        object,
-			Size:        size,
-			ModTime:     modified,
-			ETag:        etag,
-			ContentType: contentType,
-			UserDefined: metadata,
-		}, nil
-
-	// directory
-	case isDir || strings.HasPrefix(strings.TrimPrefix(name, object), "/"): // handle directories that were not explicitly created
+	if strings.HasSuffix(object, "/") || strings.HasPrefix(strings.TrimPrefix(oi.Name, object), "/") {
 		return ObjectInfo{
 			Bucket:      bucket,
 			Name:        object,
 			IsDir:       true,
 			ContentType: "application/octet-stream",
 		}, nil
-
-	default:
-		return ObjectInfo{}, ObjectNotFound{
-			Bucket: bucket,
-			Object: object,
-		}
 	}
+
+	return oi, nil
 }
 
 func (s *SQLite) readToTemp(src *PutObjReader, size int64) (_ io.Reader, done func(), err error) {
@@ -938,9 +768,9 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *Put
 
 	stmt := s.writer.Prep("INSERT INTO blobs (id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), ?);")
 	stmt.BindZeroBlob(1, size)
-	_, err = stmt.Step()
+	err = sqliteExec(stmt)
 	if err != nil {
-		return ObjectInfo{}, sqliteToMinioError(err)
+		return ObjectInfo{}, err
 	}
 
 	rowID := s.writer.LastInsertRowID()
@@ -967,9 +797,9 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *Put
 	stmt.BindInt64(6, rowID)
 	stmt.BindText(7, etag)
 	stmt.BindText(8, contentType)
-	_, err = stmt.Step()
+	err = sqliteExec(stmt)
 	if err != nil {
-		return ObjectInfo{}, sqliteToMinioError(err)
+		return ObjectInfo{}, err
 	}
 
 	return ObjectInfo{
@@ -995,9 +825,9 @@ func (s *SQLite) CopyObject(ctx context.Context, srcBucket, srcObject, destBucke
 	stmt.BindInt64(3, time.Now().UnixNano())
 	stmt.BindText(4, srcBucket)
 	stmt.BindText(5, srcObject)
-	_, err := stmt.Step()
+	err := sqliteExec(stmt)
 	if err != nil {
-		return ObjectInfo{}, sqliteToMinioError(err)
+		return ObjectInfo{}, err
 	}
 
 	return ObjectInfo{
@@ -1010,8 +840,6 @@ func (s *SQLite) DeleteObject(ctx context.Context, bucket, object string) (err e
 	defer s.mu.Unlock()
 	s.writer.SetInterrupt(ctx.Done())
 
-	defer sqlitex.Save(s.writer)(&err)
-
 	err = bucketExists(s.writer, bucket)
 	if err != nil {
 		return err
@@ -1020,9 +848,9 @@ func (s *SQLite) DeleteObject(ctx context.Context, bucket, object string) (err e
 	stmt := s.writer.Prep("DELETE FROM objects WHERE bucket = ? AND object = ?;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
-	_, err = stmt.Step()
+	err = sqliteExec(stmt)
 	if err != nil {
-		return sqliteToMinioError(err)
+		return err
 	}
 
 	if s.writer.Changes() == 0 {
@@ -1057,13 +885,6 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 	}
 	defer s.readers.Put(conn)
 
-	defer sqlitex.Save(conn)(&err)
-
-	err = bucketExists(conn, bucket)
-	if err != nil {
-		return res, err
-	}
-
 	var stmt *sqlite.Stmt
 	if delimiter == "" {
 		stmt = conn.Prep("SELECT id, object as name FROM uploads WHERE bucket = ? AND instr(object, ?) = 1 AND object > ? AND id > ? ORDER BY object LIMIT ?;")
@@ -1092,63 +913,30 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 	}
 
 	var count int
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return res, sqliteToMinioError(err)
-		}
-		if !hasRow {
-			break
-		}
-
+	_, err = sqliteExecResults(stmt, func() error {
 		count++
 		if count > maxUploads {
 			res.IsTruncated = true
-			continue
+			return nil
 		}
 
-		var (
-			id       = stmt.GetText("id")
-			name     = stmt.GetText("name")
-			isPrefix = stmt.GetInt64("is_prefix") == 1
-		)
-		res.NextKeyMarker = name
-		res.NextUploadIDMarker = id
-		if isPrefix {
-			res.CommonPrefixes = append(res.CommonPrefixes, name)
-			continue
-		}
-		res.Uploads = append(res.Uploads, MultipartInfo{
-			Object:   name,
-			UploadID: id,
+		mi := MultipartInfo{
+			Object:   stmt.ColumnText(0),
+			UploadID: stmt.ColumnText(1),
 			// TODO: Initiated
-		})
-	}
-
-	return res, nil
-}
-
-func bucketExists(conn *sqlite.Conn, bucket string) error {
-	stmt := conn.Prep("SELECT 1 FROM buckets WHERE bucket = ?;")
-	stmt.BindText(1, bucket)
-
-	var exists bool
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return sqliteToMinioError(err)
 		}
-		if !hasRow {
-			break
+		res.NextKeyMarker = mi.Object
+		res.NextUploadIDMarker = mi.UploadID
+		if delimiter != "" && stmt.ColumnInt64(2) == 1 {
+			res.CommonPrefixes = append(res.CommonPrefixes, mi.Object)
+			return nil
 		}
 
-		exists = stmt.ColumnInt64(0) == 1
-	}
+		res.Uploads = append(res.Uploads, mi)
+		return nil
+	})
 
-	if !exists {
-		return BucketNotFound{Bucket: bucket}
-	}
-	return nil
+	return res, err
 }
 
 func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (_ string, err error) {
@@ -1171,7 +959,7 @@ func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, 
 
 	// reserve a blob_id
 	stmt := s.writer.Prep("INSERT INTO blobs (id, part_id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), -1, 0);")
-	_, err = stmt.Step()
+	err = sqliteExec(stmt)
 	if err != nil {
 		return "", err
 	}
@@ -1183,9 +971,9 @@ func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, 
 	stmt.BindText(3, object)
 	stmt.BindBytes(4, mdJSON)
 	stmt.BindInt64(5, rowID)
-	_, err = stmt.Step()
+	err = sqliteExec(stmt)
 	if err != nil {
-		return "", sqliteToMinioError(err)
+		return "", err
 	}
 
 	return id, nil
@@ -1201,22 +989,18 @@ func getBlobID(conn *sqlite.Conn, bucket, object, uploadID string) (int64, error
 	stmt.BindText(2, bucket)
 	stmt.BindText(3, object)
 
-	blobID := int64(-1)
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return -1, sqliteToMinioError(err)
-		}
-		if !hasRow {
-			break
-		}
-
+	var blobID int64
+	n, err := sqliteExecResults(stmt, func() error {
 		blobID = stmt.ColumnInt64(0)
+		return nil
+	})
+	if err != nil {
+		return -1, err
 	}
-
-	if blobID == -1 {
+	if n == 0 {
 		return -1, InvalidUploadID{UploadID: uploadID}
 	}
+
 	return blobID, nil
 }
 
@@ -1252,9 +1036,9 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 	stmt.BindInt64(2, int64(partID))
 	stmt.BindZeroBlob(3, size)
 	stmt.BindText(4, etag)
-	_, err = stmt.Step()
+	err = sqliteExec(stmt)
 	if err != nil {
-		return PartInfo{}, sqliteToMinioError(err)
+		return PartInfo{}, err
 	}
 
 	// must query rowid since last insert will be incorrect on upsert
@@ -1313,33 +1097,25 @@ func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID s
 	stmt.BindInt64(3, int64(maxParts)+1)
 
 	var count int
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return res, sqliteToMinioError(err)
-		}
-		if !hasRow {
-			break
-		}
-
+	_, err = sqliteExecResults(stmt, func() error {
 		count++
 		if count > maxParts {
 			res.IsTruncated = true
-			continue
+			return nil
 		}
 
-		var (
-			partID = stmt.ColumnInt(0)
-			size   = stmt.ColumnInt64(1)
-			etag   = stmt.ColumnText(2)
-		)
+		pi := PartInfo{
+			PartNumber: stmt.ColumnInt(0),
+			Size:       stmt.ColumnInt64(1),
+			ETag:       stmt.ColumnText(2),
+		}
 
-		res.NextPartNumberMarker = partID
-		res.Parts = append(res.Parts, PartInfo{
-			PartNumber: partID,
-			Size:       size,
-			ETag:       etag,
-		})
+		res.NextPartNumberMarker = pi.PartNumber
+		res.Parts = append(res.Parts, pi)
+		return nil
+	})
+	if err != nil {
+		return res, err
 	}
 
 	if !res.IsTruncated {
@@ -1360,7 +1136,7 @@ func (s *SQLite) AbortMultipartUpload(ctx context.Context, bucket, object, uploa
 
 	stmt := s.writer.Prep("DELETE FROM uploads WHERE id = ?;")
 	stmt.BindText(1, uploadID)
-	_, err = stmt.Step()
+	err = sqliteExec(stmt)
 	if err != nil {
 		return sqliteToMinioError(err)
 	}
@@ -1395,31 +1171,26 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 		return ObjectInfo{}, err
 	}
 
-	// get existing parts
-	stmt := s.writer.Prep("SELECT part_id, etag, length(data) FROM blobs WHERE id = ? ORDER BY part_id;")
-	stmt.BindInt64(1, blobID)
-
 	type partInfo struct {
 		etag string
 		size int64
 	}
 	dbPartIDs := make(map[int]partInfo)
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return ObjectInfo{}, sqliteToMinioError(err)
-		}
-		if !hasRow {
-			break
-		}
 
+	// get existing parts
+	stmt := s.writer.Prep("SELECT part_id, etag, length(data) FROM blobs WHERE id = ? ORDER BY part_id;")
+	stmt.BindInt64(1, blobID)
+
+	_, err = sqliteExecResults(stmt, func() error {
 		id := stmt.ColumnInt(0)
-		etag := stmt.ColumnText(1)
-		size := stmt.ColumnInt64(2)
 		dbPartIDs[id] = partInfo{
-			etag: etag,
-			size: size,
+			etag: stmt.ColumnText(1),
+			size: stmt.ColumnInt64(2),
 		}
+		return nil
+	})
+	if err != nil {
+		return ObjectInfo{}, err
 	}
 
 	// validate part numbers
@@ -1444,9 +1215,9 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 		stmt = s.writer.Prep("DELETE FROM blobs WHERE id = ? AND part_id = ?;")
 		stmt.BindInt64(1, blobID)
 		stmt.BindInt64(2, int64(partID))
-		_, err = stmt.Step()
+		err = sqliteExec(stmt)
 		if err != nil {
-			return ObjectInfo{}, sqliteToMinioError(err)
+			return ObjectInfo{}, err
 		}
 	}
 
@@ -1470,17 +1241,17 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	stmt.BindInt64(5, time.Now().UnixNano())
 	stmt.BindText(6, etag)
 	stmt.BindText(7, contentType)
-	_, err = stmt.Step()
+	err = sqliteExec(stmt)
 	if err != nil {
-		return ObjectInfo{}, sqliteToMinioError(err)
+		return ObjectInfo{}, err
 	}
 
 	// remove upload
 	stmt = s.writer.Prep("DELETE FROM uploads WHERE id = ?;")
 	stmt.BindText(1, uploadID)
-	_, err = stmt.Step()
+	err = sqliteExec(stmt)
 	if err != nil {
-		return ObjectInfo{}, sqliteToMinioError(err)
+		return ObjectInfo{}, err
 	}
 
 	return ObjectInfo{
@@ -1524,9 +1295,9 @@ func (s *SQLite) SetBucketPolicy(ctx context.Context, bucket string, policy *pol
 	stmt := s.writer.Prep("UPDATE buckets SET policy = ? WHERE bucket = ?;")
 	stmt.BindBytes(1, policyJSON)
 	stmt.BindText(2, bucket)
-	_, err = stmt.Step()
+	err = sqliteExec(stmt)
 	if err != nil {
-		return sqliteToMinioError(err)
+		return err
 	}
 
 	if s.writer.Changes() == 0 {
@@ -1543,37 +1314,22 @@ func (s *SQLite) GetBucketPolicy(ctx context.Context, bucket string) (*policy.Po
 	}
 	defer s.readers.Put(conn)
 
-	stmt := conn.Prep("SELECT rowid, policy IS NOT NULL FROM buckets WHERE bucket = ?;")
+	stmt := conn.Prep("SELECT policy FROM buckets WHERE bucket = ? AND policy IS NOT NULL;")
 	stmt.BindText(1, bucket)
 
-	var (
-		rowID     int64
-		hasPolicy bool
-	)
-	for {
-		hasRow, err := stmt.Step()
-		if err != nil {
-			return nil, sqliteToMinioError(err)
-		}
-		if !hasRow {
-			break
-		}
-
-		rowID = stmt.ColumnInt64(0)
-		hasPolicy = stmt.ColumnInt64(1) == 1
+	var p *policy.Policy
+	n, err := sqliteExecResults(stmt, func() error {
+		p, err = policy.ParseConfig(stmt.ColumnReader(0), bucket)
+		return err
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	if !hasPolicy {
+	if n == 0 {
 		return nil, BucketPolicyNotFound{Bucket: bucket}
 	}
 
-	blob, err := conn.OpenBlob("", "buckets", "policy", rowID, false)
-	if err != nil {
-		return nil, sqliteToMinioError(err)
-	}
-	defer blob.Close()
-
-	return policy.ParseConfig(blob, bucket)
+	return p, nil
 }
 
 func (s *SQLite) DeleteBucketPolicy(ctx context.Context, bucket string) error {
@@ -1583,8 +1339,7 @@ func (s *SQLite) DeleteBucketPolicy(ctx context.Context, bucket string) error {
 
 	stmt := s.writer.Prep("UPDATE buckets SET policy = NULL WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
-	_, err := stmt.Step()
-	return sqliteToMinioError(err)
+	return sqliteExec(stmt)
 }
 
 // Supported operations check
@@ -1593,6 +1348,143 @@ func (s *SQLite) IsListenBucketSupported() bool { return true }
 func (s *SQLite) IsEncryptionSupported() bool   { return true }
 func (s *SQLite) IsCompressionSupported() bool  { return true }
 
+func bucketExists(conn *sqlite.Conn, bucket string) error {
+	stmt := conn.Prep("SELECT 1 FROM buckets WHERE bucket = ?;")
+	stmt.BindText(1, bucket)
+
+	n, err := sqliteExecResults(stmt, func() error { return nil })
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return BucketNotFound{Bucket: bucket}
+	}
+
+	return nil
+}
+
 func columnTime(stmt *sqlite.Stmt, col int) time.Time {
 	return time.Unix(0, stmt.ColumnInt64(col))
+}
+
+func sqliteToMinioError(err error) error {
+	if err, ok := err.(sqlite.Error); ok {
+		switch err.Code {
+		case sqlite.SQLITE_FULL:
+			return StorageFull{}
+		case sqlite.SQLITE_BUSY:
+			return OperationTimedOut{}
+		}
+	}
+	return err
+}
+
+func sqliteExec(stmt *sqlite.Stmt) error {
+	hasRow, err := stmt.Step()
+	if err != nil {
+		return sqliteToMinioError(err)
+	}
+	if hasRow {
+		return errors.New("sqlite: unexpected row in sqliteExec")
+	}
+	return nil
+}
+
+func sqliteExecResults(stmt *sqlite.Stmt, fn func() error) (int, error) {
+	var rows int
+	for {
+		hasRow, err := stmt.Step()
+		if err != nil {
+			return rows, sqliteToMinioError(err)
+		}
+		if !hasRow {
+			return rows, nil
+		}
+		rows++
+
+		err = fn()
+		if err != nil {
+			return rows, sqliteToMinioError(err)
+		}
+	}
+}
+
+func newBlobReader(bucket, object string, blobs []*sqlite.Blob, startOffset, length int64) (io.Reader, error) {
+	var r io.Reader
+	switch len(blobs) {
+	// no blobs found
+	case 0:
+		return nil, ObjectNotFound{Bucket: bucket, Object: object}
+
+	// fast path for single blob
+	// TODO: does this really make any difference?
+	case 1:
+		r = blobs[0]
+		if startOffset != 0 {
+			_, err := blobs[0].Seek(startOffset, io.SeekStart)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		if length > -1 {
+			// TODO: check startOffset+length>blob.Size()?
+			r = io.LimitReader(r, length)
+		}
+
+	// multiple blobs
+	default:
+		r = &multiBlobReader{
+			blobs:       blobs,
+			startOffset: startOffset,
+			length:      length,
+		}
+	}
+
+	return r, nil
+}
+
+type multiBlobReader struct {
+	idx         int
+	blobs       []*sqlite.Blob
+	startOffset int64
+	length      int64
+}
+
+func (br *multiBlobReader) Read(p []byte) (int, error) {
+	for {
+		if br.idx >= len(br.blobs) {
+			return 0, io.EOF
+		}
+
+		blob := br.blobs[br.idx]
+		size := blob.Size()
+
+		if br.startOffset > 0 {
+			if br.startOffset >= size {
+				br.startOffset -= size
+				blob.Close()
+				br.idx++
+				continue
+			}
+			_, err := blob.Seek(br.startOffset, io.SeekStart)
+			if err != nil {
+				return 0, err
+			}
+			br.startOffset = 0
+		}
+
+		limit := int64(len(p))
+		if br.length > -1 && limit > br.length {
+			limit = br.length
+		}
+		n, err := blob.Read(p[:limit])
+		br.length -= int64(n)
+		if err == io.EOF && br.length > 0 && len(br.blobs) > 1 {
+			blob.Close()
+			br.idx++
+			err = nil
+		}
+		return n, err
+	}
 }
