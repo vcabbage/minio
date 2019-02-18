@@ -154,8 +154,8 @@ func NewSQLiteLayer(uri *url.URL) (ObjectLayer, error) {
 		return nil, err
 	}
 
+	// return &DebugLayer{Wrapped: s, LogReturns: true, LogCallers: 1}, nil // TODO: remove
 	return s, nil
-	return &DebugLayer{Wrapped: s, LogReturns: true, LogCallers: 1}, nil // TODO: remove
 }
 
 // sqliteInitConn applies settings that every connection should have.
@@ -979,8 +979,9 @@ func (s *SQLite) DeleteObject(ctx context.Context, bucket, object string) (err e
 	return nil
 }
 
-// Multipart operations.
 func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (_ ListMultipartsInfo, err error) {
+	// This may not be 100% compliant with S3 API, but the other ObjectLayers
+	// don't support it at all so perhaps it should just be removed.
 	err = checkListMultipartArgs(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, s)
 	if err != nil {
 		return ListMultipartsInfo{}, err
@@ -1006,16 +1007,19 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 		stmt = conn.Prep(`
 			SELECT id, object as name, initiated FROM uploads
 			WHERE
-				bucket = ? AND
-				instr(object, ?) = 1 AND
-				object > ? AND
-				id > ?
-			ORDER BY object LIMIT ?;`)
-		stmt.BindText(1, bucket)
-		stmt.BindText(2, prefix)
-		stmt.BindText(3, keyMarker)
-		stmt.BindText(4, uploadIDMarker)
-		stmt.BindInt64(5, int64(maxUploads)+1)
+				bucket = $bucket AND
+				instr(object, $prefix) = 1 AND
+				(
+					($id_marker = '' AND object > $key_marker) OR
+					($id_marker <> '' AND id > $id_marker AND object >= $key_marker)
+				)
+			ORDER BY object, initiated
+			LIMIT $max_uploads;`)
+		stmt.SetText("$bucket", bucket)
+		stmt.SetText("$prefix", prefix)
+		stmt.SetText("$key_marker", keyMarker)
+		stmt.SetText("$id_marker", uploadIDMarker)
+		stmt.SetInt64("$max_uploads", int64(maxUploads)+1)
 	} else {
 		stmt = conn.Prep(`
 		SELECT DISTINCT
@@ -1035,11 +1039,13 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 		FROM uploads
 		WHERE
 			bucket = $bucket AND
-			instr(object, $prefix) = 1
-			AND object > $key_marker
-			AND id > $id_marker
-			AND instr(substr(object, length($prefix)+1), $delimiter) = 0
-		ORDER BY object
+			instr(object, $prefix) = 1 AND
+			(
+				($id_marker = '' AND object > $key_marker) OR
+				($id_marker <> '' AND id > $id_marker AND object >= $key_marker)
+			) AND
+			instr(substr(object, length($prefix)+1), $delimiter) = 0
+		ORDER BY object, initiated
 		LIMIT $max_keys;`)
 		stmt.SetText("$bucket", bucket)
 		stmt.SetText("$prefix", prefix)

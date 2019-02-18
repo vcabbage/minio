@@ -68,53 +68,6 @@ func nameForTestFunc(testFunc objTestType) string {
 	return strings.TrimPrefix(name, "test")
 }
 
-func TestSQLiteBuckets(t *testing.T) {
-	db := newTestDB(t)
-	defer db.teardown()
-
-	const bucketName = "testbucket"
-	ctx := context.Background()
-	err := db.MakeBucketWithLocation(ctx, bucketName, "")
-	testCheckErr(t, err)
-
-	// basic
-	mb, err := db.GetBucketInfo(ctx, bucketName)
-	testCheckErr(t, err)
-
-	if mb.Name != bucketName {
-		t.Errorf("expected bucket name %q, got %q", bucketName, mb.Name)
-	}
-	if timeDiff(time.Now(), mb.Created) > 10*time.Second {
-		t.Errorf("expected bucket creation time to be near time.Now(), got %s", mb.Created)
-	}
-
-	// creating the same bucket is a nop
-	err = db.MakeBucketWithLocation(ctx, bucketName, "")
-	testCheckErr(t, err)
-	previousCreateTime := mb.Created
-	mb, err = db.GetBucketInfo(ctx, bucketName)
-	testCheckErr(t, err)
-	if !mb.Created.Equal(previousCreateTime) {
-		t.Errorf("expected bucket creation time to be %s, got %s", previousCreateTime, mb.Created)
-	}
-
-	db.exec("SELECT COUNT(1) FROM buckets", 1, func(stmt *sqlite.Stmt) {
-		count := stmt.ColumnInt64(0)
-		if count != 2 { // should always have a .minio.sys bucket
-			t.Errorf("expected 2 buckets, got %d", count)
-		}
-	})
-
-	// ListBuckets does not include reserved bucket names
-	bs, err := db.ListBuckets(ctx)
-	testCheckErr(t, err)
-	for _, b := range bs {
-		if isMinioMetaBucketName(b.Name) {
-			t.Errorf("found reserved name %q in bucket listing", b.Name)
-		}
-	}
-}
-
 type testDB struct {
 	*SQLite
 	t *testing.T
