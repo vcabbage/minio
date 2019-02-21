@@ -106,7 +106,7 @@ type SQLite struct {
 	readers *sqlitex.Pool
 
 	// SQLite only allows a single writer at a time. To simplify
-	// the code, have a dedicated writer conn protected my mutex.
+	// the code, have a dedicated writer conn protected by mutex.
 	mu         sync.Mutex
 	writer     *sqlite.Conn
 	copyBuffer []byte // buffer used for writer io.CopyBuffer
@@ -190,7 +190,7 @@ func (s *SQLite) init() (err error) {
 		}
 	}
 
-	// Execute migration necessary scripts.
+	// Execute necessary migration scripts.
 	for _, migration := range sqliteMigrations[migrationStart:] {
 		err := sqlitex.ExecScript(s.writer, migration)
 		if err != nil {
@@ -338,6 +338,7 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 			Created: columnTime(stmt, 1),
 		}
 
+		// Don't include meta bucket in listing.
 		if isMinioMetaBucketName(b.Name) {
 			return nil
 		}
@@ -359,6 +360,8 @@ func (s *SQLite) DeleteBucket(ctx context.Context, bucket string) (err error) {
 
 	err = sqliteExec(stmt)
 	if sqlite.ErrCode(err) == sqlite.SQLITE_CONSTRAINT_TRIGGER {
+		// Table constraints prevent deleting a bucket containing
+		// any objects. Provided foreign_keys are enabled on the connection.
 		return BucketNotEmpty{Bucket: bucket}
 	}
 	return err
@@ -386,10 +389,10 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 	var stmt *sqlite.Stmt
 	if delimiter == "" {
 		stmt = conn.Prep(`
-			SELECT object as name, size, modified, etag FROM objects
+			SELECT object as name, size, modified, etag, metadata FROM objects
 			WHERE
 				bucket = ? AND
-				instr(object, ?) = 1 AND
+				INSTR(object, ?) = 1 AND
 				object > ?
 			ORDER BY object LIMIT ?;`)
 		stmt.BindText(1, bucket)
@@ -398,26 +401,30 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 		stmt.BindInt64(4, int64(maxKeys)+1)
 	} else {
 		stmt = conn.Prep(`
-		SELECT DISTINCT
-			substr(object, 1, length($prefix) + instr(substr(object, length($prefix)+1), $delimiter)) as name,
-			0 as size,
-			0 as modified,
-			'' as etag,
-			1 as is_prefix
-		FROM objects
-		WHERE
-			bucket = $bucket AND
-			instr(object, $prefix) = 1 AND
-			object > $marker AND
-			name <> $prefix
-		UNION
-		SELECT object as name, size, modified, etag, 0 as is_prefix
-		FROM objects
-		WHERE
-			bucket = $bucket AND
-			instr(object, $prefix) = 1 AND
-			object > $marker AND
-			instr(substr(object, length($prefix)+1), $delimiter) = 0
+		WITH
+		prefixed AS (
+			SELECT
+				object, size, modified, etag, metadata,
+				INSTR(SUBSTR(object, LENGTH($prefix)+1), $delimiter) as delimiter_index
+			FROM objects
+			WHERE
+				bucket = $bucket AND
+				INSTR(object, $prefix) = 1 AND
+				object > $marker
+		),
+		result_objects AS (
+			SELECT object, size, modified, etag, metadata
+			FROM prefixed
+			WHERE delimiter_index = 0
+		),
+		result_prefixes AS (
+			SELECT DISTINCT SUBSTR(object, 1, LENGTH($prefix) + delimiter_index) as object
+			FROM prefixed
+			WHERE delimiter_index > 0
+		)
+		SELECT object, size, modified, etag, metadata, 0 as is_prefix FROM result_objects
+		UNION ALL
+		SELECT object, 0 as size, 0 as modified, '' as etag, NULL as metadata, 1 as is_prefix FROM result_prefixes
 		ORDER BY object
 		LIMIT $max_keys;`)
 		stmt.SetText("$bucket", bucket)
@@ -438,18 +445,24 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 
 		name := stmt.ColumnText(0)
 		objects.NextMarker = name
-		if delimiter != "" && stmt.ColumnInt64(4) == 1 { // is_prefix
+		if delimiter != "" && stmt.ColumnInt64(5) == 1 { // is_prefix
 			objects.Prefixes = append(objects.Prefixes, name)
 			return nil
 		}
 
-		objects.Objects = append(objects.Objects, ObjectInfo{
+		oi := ObjectInfo{
 			Bucket:  bucket,
 			Name:    name,
 			Size:    stmt.ColumnInt64(1),
 			ModTime: columnTime(stmt, 2),
 			ETag:    stmt.ColumnText(3),
-		})
+		}
+		err := json.NewDecoder(stmt.ColumnReader(4)).Decode(&oi.UserDefined)
+		if err != nil {
+			return err
+		}
+
+		objects.Objects = append(objects.Objects, oi)
 
 		return nil
 	})
@@ -463,6 +476,7 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 
 	return objects, nil
 }
+
 func (s *SQLite) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (ListObjectsV2Info, error) {
 	marker := continuationToken
 	if marker == "" {
@@ -508,7 +522,33 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		}
 	}()
 
-	stmt := conn.Prep("SELECT object, blob_id, modified, size, metadata, etag FROM objects WHERE bucket = ? AND instr(object, ?) = 1 ORDER BY object LIMIT 1;")
+	// directory
+	if strings.HasSuffix(object, slashSeparator) {
+		stmt := conn.Prep(`SELECT 1 FROM objects WHERE bucket = ?1 AND INSTR(object, ?2) = 1 LIMIT 1;`)
+		stmt.BindText(1, bucket)
+		stmt.BindText(2, object)
+		n, err := sqliteExecResults(stmt, nil)
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			return nil, ObjectNotFound{
+				Bucket: bucket,
+				Object: object,
+			}
+		}
+		info := ObjectInfo{
+			Bucket: bucket,
+			Name:   object,
+			IsDir:  true,
+		}
+		return NewGetObjectReaderFromReader(bytes.NewReader(nil), info), nil
+	}
+
+	stmt := conn.Prep(`
+		SELECT object, modified, size, etag, metadata, blob_id
+		FROM objects
+		WHERE bucket = ?1 AND object = ?2;`)
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 
@@ -519,15 +559,15 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 	n, err := sqliteExecResults(stmt, func() error {
 		oi = ObjectInfo{
 			Name:    stmt.ColumnText(0),
-			ModTime: columnTime(stmt, 2),
-			Size:    stmt.ColumnInt64(3),
-			ETag:    stmt.ColumnText(5),
+			ModTime: columnTime(stmt, 1),
+			Size:    stmt.ColumnInt64(2),
+			ETag:    stmt.ColumnText(3),
 		}
 		err := json.NewDecoder(stmt.ColumnReader(4)).Decode(&oi.UserDefined)
 		if err != nil {
 			return err
 		}
-		blobID = stmt.ColumnInt64(1)
+		blobID = stmt.ColumnInt64(5)
 		return nil
 	})
 	if err != nil {
@@ -541,27 +581,9 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		}
 	}
 
-	// directory
-	if strings.HasSuffix(object, slashSeparator) || strings.HasPrefix(strings.TrimPrefix(oi.Name, object), slashSeparator) {
-		info := ObjectInfo{
-			Bucket: bucket,
-			Name:   object,
-			IsDir:  true,
-		}
-		return NewGetObjectReaderFromReader(bytes.NewReader(nil), info, func() {}), nil
-	}
-
-	startOffset, length, err := rs.GetOffsetLength(oi.Size)
+	objReaderFn, startOffset, length, err := NewGetObjectReader(rs, oi)
 	if err != nil {
 		return nil, err
-	}
-
-	if startOffset > oi.Size || startOffset+length > oi.Size {
-		return nil, InvalidRange{
-			OffsetBegin:  startOffset,
-			OffsetEnd:    length,
-			ResourceSize: oi.Size,
-		}
 	}
 
 	var blobs []*sqlite.Blob
@@ -603,7 +625,7 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		}
 		s.readers.Put(conn)
 	}
-	return NewGetObjectReaderFromReader(rdr, oi, closer), nil
+	return objReaderFn(rdr, h, closer)
 }
 
 func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffset, length int64, writer io.Writer, etag string, opts ObjectOptions) error {
@@ -623,16 +645,17 @@ func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffs
 
 	// Check if directory.
 	if hasSuffix(object, slashSeparator) {
-		stmt := conn.Prep("SELECT 1 FROM objects WHERE bucket = ? AND instr(object, ?) = 1 LIMIT 1;")
+		stmt := conn.Prep("SELECT 1 FROM objects WHERE bucket = ? AND INSTR(object, ?) = 1 LIMIT 1;")
 		stmt.BindText(1, bucket)
 		stmt.BindText(2, object)
-		_, err = sqliteExecResults(stmt, func() error {
-			if stmt.ColumnInt64(0) != 1 {
-				return ObjectNotFound{Bucket: bucket, Object: object}
-			}
-			return nil
-		})
-		return err
+		n, err := sqliteExecResults(stmt, nil)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ObjectNotFound{Bucket: bucket, Object: object}
+		}
+		return nil
 	}
 
 	stmt := conn.Prep("SELECT blob_id, size, etag FROM objects WHERE bucket = ? AND object = ?;")
@@ -719,7 +742,7 @@ func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts 
 		return ObjectInfo{}, err
 	}
 
-	stmt := conn.Prep("SELECT object, size, modified, etag, content_type, metadata FROM objects WHERE bucket = ? AND instr(object, ?) = 1 ORDER BY object LIMIT 1;")
+	stmt := conn.Prep("SELECT object, size, modified, etag, content_type, metadata FROM objects WHERE bucket = ? AND INSTR(object, ?) = 1 ORDER BY object LIMIT 1;")
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 
@@ -754,29 +777,30 @@ func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts 
 	return oi, nil
 }
 
-func (s *SQLite) readToTemp(src *PutObjReader, size int64) (_ io.Reader, done func(), err error) {
-	if size <= sqliteTempFileThreshold {
+func (s *SQLite) readToTemp(src *PutObjReader, size int64) (_ io.Reader, actual int64, done func(), err error) {
+	// TODO: reasonable way to use in memory buffer when size == -1, overflow to tempfile?
+	if size >= 0 && size <= sqliteTempFileThreshold {
 		b := make([]byte, size)
 		_, err := io.ReadFull(src, b)
 		if err != nil {
 			if err == io.ErrUnexpectedEOF || err == io.EOF {
 				err = IncompleteBody{}
 			}
-			return nil, nil, err
+			return nil, 0, nil, err
 		}
 
 		// Verify normally happens on EOF, but an EOF isn't
 		// returned when reading the exact size.
 		err = src.Verify()
 		if err != nil {
-			return nil, nil, err
+			return nil, 0, nil, err
 		}
-		return bytes.NewReader(b), func() {}, nil
+		return bytes.NewReader(b), int64(len(b)), func() {}, nil
 	}
 
 	f, err := ioutil.TempFile(s.tempDir, "")
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
 
 	name := f.Name()
@@ -795,17 +819,17 @@ func (s *SQLite) readToTemp(src *PutObjReader, size int64) (_ io.Reader, done fu
 
 	n, err := io.Copy(f, src)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
-	if n < size {
-		return nil, nil, IncompleteBody{}
+	if n >= 0 && n < size {
+		return nil, 0, nil, IncompleteBody{}
 	}
 	_, err = f.Seek(0, 0)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
 
-	return f, doneFunc, nil
+	return f, n, doneFunc, nil
 }
 
 func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (_ ObjectInfo, err error) {
@@ -820,11 +844,15 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *Put
 		return ObjectInfo{}, err
 	}
 
-	src, done, err := s.readToTemp(data, size)
+	src, actualSize, done, err := s.readToTemp(data, size)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 	defer done()
+
+	if size < 0 {
+		size = actualSize
+	}
 
 	etag := data.MD5CurrentHexString()
 	contentType := mimedb.TypeByExtension(path.Ext(object))
@@ -858,11 +886,11 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *Put
 		INSERT INTO objects (bucket, object, size, metadata, modified, blob_id, etag, content_type)
 		VALUES (?, ?, ?, ?, ?, (SELECT id FROM blobs WHERE rowid = ?), ?, ?)
 		ON CONFLICT (bucket, object) DO UPDATE SET
-			size=excluded.size,
-			metadata=excluded.metadata,
-			modified=excluded.modified,
-			blob_id=excluded.blob_id,
-			etag=excluded.etag;`)
+			size=EXCLUDED.size,
+			metadata=EXCLUDED.metadata,
+			modified=EXCLUDED.modified,
+			blob_id=EXCLUDED.blob_id,
+			etag=EXCLUDED.etag;`)
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 	stmt.BindInt64(3, size)
@@ -1008,11 +1036,12 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 			SELECT id, object as name, initiated FROM uploads
 			WHERE
 				bucket = $bucket AND
-				instr(object, $prefix) = 1 AND
-				(
-					($id_marker = '' AND object > $key_marker) OR
-					($id_marker <> '' AND id > $id_marker AND object >= $key_marker)
-				)
+				INSTR(object, $prefix) = 1 AND
+				CASE WHEN $id_marker = '' THEN
+					object > $key_marker
+				ELSE
+					id > $id_marker AND object >= $key_marker
+				END
 			ORDER BY object, initiated
 			LIMIT $max_uploads;`)
 		stmt.SetText("$bucket", bucket)
@@ -1024,13 +1053,13 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 		stmt = conn.Prep(`
 		SELECT DISTINCT
 			id,
-			substr(object, 1, length($prefix) + instr(substr(object, length($prefix)+1), $delimiter)) as name,
+			SUBSTR(object, 1, LENGTH($prefix) + INSTR(SUBSTR(object, LENGTH($prefix)+1), $delimiter)) as name,
 			0 as initiated,
 			1 as is_prefix
 		FROM uploads
 		WHERE
 			bucket = $bucket AND
-			instr(object, $prefix) = 1 AND
+			INSTR(object, $prefix) = 1 AND
 			object > $key_marker AND
 			id > $id_marker AND
 			name <> $prefix
@@ -1039,12 +1068,13 @@ func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMa
 		FROM uploads
 		WHERE
 			bucket = $bucket AND
-			instr(object, $prefix) = 1 AND
-			(
-				($id_marker = '' AND object > $key_marker) OR
-				($id_marker <> '' AND id > $id_marker AND object >= $key_marker)
-			) AND
-			instr(substr(object, length($prefix)+1), $delimiter) = 0
+			INSTR(object, $prefix) = 1 AND
+			CASE WHEN $id_marker = '' THEN
+				object > $key_marker
+			ELSE
+				id > $id_marker AND object >= $key_marker
+			END AND
+			INSTR(SUBSTR(object, LENGTH($prefix)+1), $delimiter) = 0
 		ORDER BY object, initiated
 		LIMIT $max_keys;`)
 		stmt.SetText("$bucket", bucket)
@@ -1163,11 +1193,15 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 
 	size := data.Size()
 
-	src, done, err := s.readToTemp(data, size)
+	src, actualSize, done, err := s.readToTemp(data, size)
 	if err != nil {
 		return PartInfo{}, err
 	}
 	defer done()
+
+	if size < 0 {
+		size = actualSize
+	}
 
 	etag := data.MD5CurrentHexString()
 
@@ -1182,7 +1216,7 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 		return PartInfo{}, err
 	}
 
-	stmt := s.writer.Prep("INSERT INTO blobs (id, part_id, data, etag) VALUES (?, ?, ?, ?) ON CONFLICT (id, part_id) DO UPDATE SET data = excluded.data;")
+	stmt := s.writer.Prep("INSERT INTO blobs (id, part_id, data, etag) VALUES (?, ?, ?, ?) ON CONFLICT (id, part_id) DO UPDATE SET data = EXCLUDED.data;")
 	stmt.BindInt64(1, blobID)
 	stmt.BindInt64(2, int64(partID))
 	stmt.BindZeroBlob(3, size)
@@ -1242,7 +1276,7 @@ func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID s
 		return ListPartsInfo{}, err
 	}
 
-	stmt := conn.Prep("SELECT part_id, length(data), etag FROM blobs WHERE id = ? AND part_id <> -1 AND part_id > ? ORDER BY part_id LIMIT ?;")
+	stmt := conn.Prep("SELECT part_id, LENGTH(data), etag FROM blobs WHERE id = ? AND part_id <> -1 AND part_id > ? ORDER BY part_id LIMIT ?;")
 	stmt.BindInt64(1, blobID)
 	stmt.BindInt64(2, int64(partNumberMarker))
 	stmt.BindInt64(3, int64(maxParts)+1)
@@ -1329,7 +1363,7 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	dbPartIDs := make(map[int]partInfo)
 
 	// get existing parts
-	stmt := s.writer.Prep("SELECT part_id, etag, length(data) FROM blobs WHERE id = ? ORDER BY part_id;")
+	stmt := s.writer.Prep("SELECT part_id, etag, LENGTH(data) FROM blobs WHERE id = ? ORDER BY part_id;")
 	stmt.BindInt64(1, blobID)
 
 	_, err = sqliteExecResults(stmt, func() error {
@@ -1380,10 +1414,10 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 			(SELECT metadata FROM uploads WHERE id = ?7)
 		)
 		ON CONFLICT (bucket, object) DO UPDATE SET
-			size=excluded.size,
-			metadata=excluded.metadata,
-			modified=excluded.modified,
-			blob_id=excluded.blob_id;`)
+			size=EXCLUDED.size,
+			metadata=EXCLUDED.metadata,
+			modified=EXCLUDED.modified,
+			blob_id=EXCLUDED.blob_id;`)
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 	stmt.BindInt64(3, time.Now().UnixNano())
