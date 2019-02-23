@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -57,10 +58,11 @@ var sqliteMigrations = []string{
 		created  INTEGER NOT NULL
 	);
 	CREATE TABLE blobs (
-		id       INTEGER NOT NULL,
-		part_id  INTEGER NOT NULL DEFAULT 0,
-		etag     TEXT,
-		data     BLOB    NOT NULL,
+		id          INTEGER NOT NULL,
+		part_id     INTEGER NOT NULL DEFAULT 0,
+		etag        TEXT,
+		data        BLOB    NOT NULL,
+		actual_size INTEGER NOT NULL,
 		PRIMARY KEY (id, part_id)
 	);
 	CREATE TABLE objects (
@@ -188,6 +190,10 @@ func (s *SQLite) init() (err error) {
 		if err != nil {
 			return err
 		}
+	}
+
+	if migrationStart > len(sqliteMigrations) {
+		return fmt.Errorf("sqlite: database schema version higher than layer schema (%d > %d)", migrationStart, len(sqliteMigrations))
 	}
 
 	// Execute necessary migration scripts.
@@ -844,18 +850,19 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *Put
 		return ObjectInfo{}, err
 	}
 
-	src, actualSize, done, err := s.readToTemp(data, size)
+	src, readSize, done, err := s.readToTemp(data, size)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 	defer done()
 
 	if size < 0 {
-		size = actualSize
+		size = readSize
 	}
 
 	etag := data.MD5CurrentHexString()
 	contentType := mimedb.TypeByExtension(path.Ext(object))
+	actualSize := data.ActualSize()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -863,8 +870,9 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *Put
 
 	defer sqlitex.Save(s.writer)(&err)
 
-	stmt := s.writer.Prep("INSERT INTO blobs (id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), ?);")
+	stmt := s.writer.Prep("INSERT INTO blobs (id, data, actual_size) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), ?1, ?2);")
 	stmt.BindZeroBlob(1, size)
+	stmt.BindInt64(2, actualSize)
 	err = sqliteExec(stmt)
 	if err != nil {
 		return ObjectInfo{}, err
@@ -1136,7 +1144,7 @@ func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, 
 	defer sqlitex.Save(s.writer)(&err)
 
 	// reserve a blob_id
-	stmt := s.writer.Prep("INSERT INTO blobs (id, part_id, data) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), -1, 0);")
+	stmt := s.writer.Prep("INSERT INTO blobs (id, part_id, data, actual_size) VALUES ((SELECT COALESCE(MAX(id), 0)+1 FROM blobs), -1, 0, 0);")
 	err = sqliteExec(stmt)
 	if err != nil {
 		return "", err
@@ -1164,25 +1172,32 @@ func (s *SQLite) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destB
 	return s.PutObjectPart(ctx, destBucket, destObject, uploadID, partID, srcInfo.PutObjReader, dstOpts)
 }
 
-func getBlobID(conn *sqlite.Conn, bucket, object, uploadID string) (int64, error) {
-	stmt := conn.Prep("SELECT blob_id FROM uploads WHERE id = ? AND bucket = ? AND object = ?")
+func getBlobID(conn *sqlite.Conn, bucket, object, uploadID string, includeMetadata bool) (int64, map[string]string, error) {
+	stmt := conn.Prep("SELECT blob_id, metadata FROM uploads WHERE id = ? AND bucket = ? AND object = ?")
 	stmt.BindText(1, uploadID)
 	stmt.BindText(2, bucket)
 	stmt.BindText(3, object)
 
-	var blobID int64
+	var (
+		blobID   int64
+		metadata map[string]string
+	)
 	n, err := sqliteExecResults(stmt, func() error {
 		blobID = stmt.ColumnInt64(0)
-		return nil
+		if !includeMetadata {
+			return nil
+		}
+
+		return json.NewDecoder(stmt.ColumnReader(1)).Decode(&metadata)
 	})
 	if err != nil {
-		return -1, err
+		return -1, nil, err
 	}
 	if n == 0 {
-		return -1, InvalidUploadID{UploadID: uploadID}
+		return -1, nil, InvalidUploadID{UploadID: uploadID}
 	}
 
-	return blobID, nil
+	return blobID, metadata, nil
 }
 
 func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *PutObjReader, opts ObjectOptions) (_ PartInfo, err error) {
@@ -1193,17 +1208,18 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 
 	size := data.Size()
 
-	src, actualSize, done, err := s.readToTemp(data, size)
+	src, readSize, done, err := s.readToTemp(data, size)
 	if err != nil {
 		return PartInfo{}, err
 	}
 	defer done()
 
 	if size < 0 {
-		size = actualSize
+		size = readSize
 	}
 
 	etag := data.MD5CurrentHexString()
+	actualSize := data.ActualSize()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1211,28 +1227,37 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 
 	defer sqlitex.Save(s.writer)(&err)
 
-	blobID, err := getBlobID(s.writer, bucket, object, uploadID)
+	blobID, _, err := getBlobID(s.writer, bucket, object, uploadID, false)
 	if err != nil {
 		return PartInfo{}, err
 	}
 
-	stmt := s.writer.Prep("INSERT INTO blobs (id, part_id, data, etag) VALUES (?, ?, ?, ?) ON CONFLICT (id, part_id) DO UPDATE SET data = EXCLUDED.data;")
+	prevInsertRowID := s.writer.LastInsertRowID()
+
+	stmt := s.writer.Prep("INSERT INTO blobs (id, part_id, data, etag, actual_size) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id, part_id) DO UPDATE SET data = EXCLUDED.data;")
 	stmt.BindInt64(1, blobID)
 	stmt.BindInt64(2, int64(partID))
 	stmt.BindZeroBlob(3, size)
 	stmt.BindText(4, etag)
+	stmt.BindInt64(5, actualSize)
 	err = sqliteExec(stmt)
 	if err != nil {
 		return PartInfo{}, err
 	}
 
-	// must query rowid since last insert will be incorrect on upsert
-	stmt = s.writer.Prep("SELECT rowid FROM blobs WHERE id = ? AND part_id = ?")
-	stmt.BindInt64(1, blobID)
-	stmt.BindInt64(2, int64(partID))
-	rowID, err := sqlitex.ResultInt64(stmt)
-	if err != nil {
-		return PartInfo{}, sqliteToMinioError(err)
+	rowID := s.writer.LastInsertRowID()
+
+	// If LastInsertRowID has changed an insert happened,
+	// if it's the same an update happened and the rowID
+	// needs to be queried.
+	if rowID == prevInsertRowID {
+		stmt = s.writer.Prep("SELECT rowid FROM blobs WHERE id = ? AND part_id = ?")
+		stmt.BindInt64(1, blobID)
+		stmt.BindInt64(2, int64(partID))
+		rowID, err = sqlitex.ResultInt64(stmt)
+		if err != nil {
+			return PartInfo{}, sqliteToMinioError(err)
+		}
 	}
 
 	blob, err := s.writer.OpenBlob("", "blobs", "data", rowID, true)
@@ -1246,11 +1271,27 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 		return PartInfo{}, err
 	}
 
-	return PartInfo{PartNumber: partID, ETag: etag}, nil
+	return PartInfo{
+		PartNumber: partID,
+		ETag:       etag,
+		Size:       size,
+		ActualSize: actualSize,
+	}, nil
 }
 
 func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int, opts ObjectOptions) (ListPartsInfo, error) {
 	err := checkListPartsArgs(ctx, bucket, object, s)
+	if err != nil {
+		return ListPartsInfo{}, err
+	}
+
+	conn, err := s.getConn(ctx)
+	if err != nil {
+		return ListPartsInfo{}, err
+	}
+	defer s.readers.Put(conn)
+
+	blobID, metadata, err := getBlobID(conn, bucket, object, uploadID, true)
 	if err != nil {
 		return ListPartsInfo{}, err
 	}
@@ -1261,22 +1302,12 @@ func (s *SQLite) ListObjectParts(ctx context.Context, bucket, object, uploadID s
 		UploadID:         uploadID,
 		PartNumberMarker: partNumberMarker,
 		MaxParts:         maxParts,
-		// UserDefined
+		UserDefined:      metadata,
 		// EncodingType
 	}
 
-	conn, err := s.getConn(ctx)
-	if err != nil {
-		return res, err
-	}
-	defer s.readers.Put(conn)
-
-	blobID, err := getBlobID(conn, bucket, object, uploadID)
-	if err != nil {
-		return ListPartsInfo{}, err
-	}
-
-	stmt := conn.Prep("SELECT part_id, LENGTH(data), etag FROM blobs WHERE id = ? AND part_id <> -1 AND part_id > ? ORDER BY part_id LIMIT ?;")
+	// TODO: add modified time
+	stmt := conn.Prep("SELECT part_id, actual_size, etag FROM blobs WHERE id = ? AND part_id <> -1 AND part_id > ? ORDER BY part_id LIMIT ?;")
 	stmt.BindInt64(1, blobID)
 	stmt.BindInt64(2, int64(partNumberMarker))
 	stmt.BindInt64(3, int64(maxParts)+1)
@@ -1351,26 +1382,28 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 
 	defer sqlitex.Save(s.writer)(&err)
 
-	blobID, err := getBlobID(s.writer, bucket, object, uploadID)
+	blobID, _, err := getBlobID(s.writer, bucket, object, uploadID, false)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
 
 	type partInfo struct {
-		etag string
-		size int64
+		etag       string
+		size       int64
+		actualSize int64
 	}
 	dbPartIDs := make(map[int]partInfo)
 
 	// get existing parts
-	stmt := s.writer.Prep("SELECT part_id, etag, LENGTH(data) FROM blobs WHERE id = ? ORDER BY part_id;")
+	stmt := s.writer.Prep("SELECT part_id, etag, LENGTH(data), actual_size FROM blobs WHERE id = ? ORDER BY part_id;")
 	stmt.BindInt64(1, blobID)
 
 	_, err = sqliteExecResults(stmt, func() error {
 		id := stmt.ColumnInt(0)
 		dbPartIDs[id] = partInfo{
-			etag: stmt.ColumnText(1),
-			size: stmt.ColumnInt64(2),
+			etag:       stmt.ColumnText(1),
+			size:       stmt.ColumnInt64(2),
+			actualSize: stmt.ColumnInt64(3),
 		}
 		return nil
 	})
@@ -1380,18 +1413,24 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 
 	// validate part numbers
 	lastPart := len(uploadedParts) - 1
+	var (
+		size       int64
+		actualSize int64
+	)
 	for i, part := range uploadedParts {
 		dbPart, ok := dbPartIDs[part.PartNumber]
 		if !ok || part.ETag != dbPart.etag {
 			return ObjectInfo{}, InvalidPart{PartNumber: part.PartNumber}
 		}
-		if !isMinAllowedPartSize(dbPart.size) && i != lastPart {
+		if !isMinAllowedPartSize(dbPart.actualSize) && i != lastPart {
 			return ObjectInfo{}, PartTooSmall{
 				PartNumber: part.PartNumber,
-				PartSize:   dbPart.size,
+				PartSize:   dbPart.actualSize,
 				PartETag:   part.ETag,
 			}
 		}
+		size += dbPart.size
+		actualSize += dbPart.actualSize
 		delete(dbPartIDs, part.PartNumber)
 	}
 
@@ -1409,22 +1448,25 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	// create object
 	stmt = s.writer.Prep(`
 		INSERT INTO objects (bucket, object, modified, blob_id, etag, content_type, size, metadata) VALUES (
-			?1, ?2, ?3, ?4, ?5, ?6,
-			(SELECT SUM(LENGTH(data)) FROM blobs WHERE id = ?4),
-			(SELECT metadata FROM uploads WHERE id = ?7)
+			?1, ?2, ?3, ?4, ?5, ?6, ?7,
+			(SELECT json_set(metadata, '$.` + ReservedMetadataPrefix + `actual-size', CAST(?8 AS TEXT)) FROM uploads WHERE id = ?9)
 		)
 		ON CONFLICT (bucket, object) DO UPDATE SET
-			size=EXCLUDED.size,
-			metadata=EXCLUDED.metadata,
 			modified=EXCLUDED.modified,
-			blob_id=EXCLUDED.blob_id;`)
+			blob_id=EXCLUDED.blob_id,
+			etag=EXCLUDED.etag,
+			content_type=EXCLUDED.content_type,
+			size=EXCLUDED.size,
+			metadata=EXCLUDED.metadata;`)
 	stmt.BindText(1, bucket)
 	stmt.BindText(2, object)
 	stmt.BindInt64(3, time.Now().UnixNano())
 	stmt.BindInt64(4, blobID)
 	stmt.BindText(5, etag)
 	stmt.BindText(6, contentType)
-	stmt.BindText(7, uploadID)
+	stmt.BindInt64(7, size)
+	stmt.BindInt64(8, actualSize)
+	stmt.BindText(9, uploadID)
 	err = sqliteExec(stmt)
 	if err != nil {
 		return ObjectInfo{}, err
