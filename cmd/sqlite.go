@@ -783,59 +783,155 @@ func (s *SQLite) GetObjectInfo(ctx context.Context, bucket, object string, opts 
 	return oi, nil
 }
 
-func (s *SQLite) readToTemp(src *PutObjReader, size int64) (_ io.Reader, actual int64, done func(), err error) {
-	// TODO: reasonable way to use in memory buffer when size == -1, overflow to tempfile?
+type tempBuffer struct {
+	tempDir string // directory where f will be created
+	size    int64
+
+	// buf is used as the data store up to len(buf). If the buffer
+	// is exceeded the existing data is flushed to f and buf is reused
+	// as a copy buffer.
+	buf []byte
+	bw  int // buf read offset
+	br  int // buf write offset
+
+	f  *os.File // lazily created file when written data exceeds buf
+	fw int64    // f write offset
+}
+
+func newTempBuffer(tempDir string, src *PutObjReader, size int64) (*tempBuffer, int64, error) {
+	// TODO: document this behavior
+	if size == 0 {
+		return nil, 0, nil
+	}
+
+	bufSize := readSizeV1
 	if size >= 0 && size <= sqliteTempFileThreshold {
-		b := make([]byte, size)
-		_, err := io.ReadFull(src, b)
-		if err != nil {
-			if err == io.ErrUnexpectedEOF || err == io.EOF {
-				err = IncompleteBody{}
-			}
-			return nil, 0, nil, err
-		}
-
-		// Verify normally happens on EOF, but an EOF isn't
-		// returned when reading the exact size.
-		err = src.Verify()
-		if err != nil {
-			return nil, 0, nil, err
-		}
-		return bytes.NewReader(b), int64(len(b)), func() {}, nil
+		bufSize = int(size)
 	}
 
-	f, err := ioutil.TempFile(s.tempDir, "")
+	tmpBuf := &tempBuffer{
+		size:    size,
+		tempDir: tempDir,
+		buf:     make([]byte, bufSize),
+	}
+
+	read, err := tmpBuf.ReadFrom(src)
 	if err != nil {
-		return nil, 0, nil, err
+		tmpBuf.Close()
+		return nil, read, err
 	}
 
-	name := f.Name()
-	// Declared as doneFunc instead of assigning to done
-	// so that the defer still references the function
-	//even even when nil is returned for done.
-	doneFunc := func() {
-		f.Close()
+	if size >= 0 && read != size {
+		return nil, read, IncompleteBody{}
+	}
+
+	// Verify normally happens on EOF, but an EOF isn't
+	// returned when reading the exact size.
+	err = src.Verify()
+	if err != nil {
+		return nil, read, err
+	}
+
+	return tmpBuf, read, nil
+}
+
+func (tb *tempBuffer) ReadFrom(r io.Reader) (int64, error) {
+	if tb == nil {
+		return 0, nil
+	}
+
+	var written int64
+	for tb.bw < len(tb.buf) {
+		n, err := r.Read(tb.buf[tb.bw:])
+		tb.bw += n
+		written += int64(n)
+		if err != nil {
+			if err == io.EOF {
+				return written, nil
+			}
+			return written, err
+		}
+	}
+
+	if tb.size >= 0 && int64(tb.bw) >= tb.size {
+		return written, nil
+	}
+
+	// buffer exceeded, tb.buf now used to as copy buffer
+
+	if tb.f == nil {
+		f, err := ioutil.TempFile(tb.tempDir, "")
+		if err != nil {
+			return written, err
+		}
+		tb.f = f
+
+		// write existing buffer contents to file
+		n, err := f.WriteAt(tb.buf[tb.br:tb.bw], tb.fw)
+		tb.br += n
+		tb.fw += int64(n)
+		if tb.br != tb.bw {
+			return written, io.ErrShortWrite
+		}
+		if err != nil {
+			return written, err
+		}
+	}
+
+	// this is the same as io.CopyBuffer except using WriteAt.
+	for {
+		nr, errr := r.Read(tb.buf)
+		if nr > 0 {
+			nw, errw := tb.f.WriteAt(tb.buf[:nr], tb.fw)
+			written += int64(nw)
+			tb.fw += int64(nw)
+			if errw != nil {
+				return written, errw
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if errr != nil {
+			if errr == io.EOF {
+				return written, nil
+			}
+			return written, errr
+		}
+	}
+}
+
+func (tb *tempBuffer) WriteTo(w io.Writer) (int64, error) {
+	if tb == nil {
+		return 0, nil
+	}
+
+	var read int64
+
+	if tb.br < tb.bw {
+		n, err := w.Write(tb.buf[tb.br:tb.bw])
+		tb.br += n
+		read += int64(n)
+		if err != nil {
+			return read, err
+		}
+	}
+
+	if tb.f == nil {
+		return read, nil
+	}
+
+	n, err := io.CopyBuffer(w, tb.f, tb.buf)
+	read += n
+	return read, err
+}
+
+func (tb *tempBuffer) Close() {
+	if tb != nil && tb.f != nil {
+		name := tb.f.Name()
+		tb.f.Close()
 		os.Remove(name)
 	}
-	defer func() {
-		if err != nil {
-			doneFunc()
-		}
-	}()
-
-	n, err := io.Copy(f, src)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-	if n >= 0 && n < size {
-		return nil, 0, nil, IncompleteBody{}
-	}
-	_, err = f.Seek(0, 0)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-
-	return f, n, doneFunc, nil
 }
 
 func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (_ ObjectInfo, err error) {
@@ -850,11 +946,11 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *Put
 		return ObjectInfo{}, err
 	}
 
-	src, readSize, done, err := s.readToTemp(data, size)
+	src, readSize, err := newTempBuffer(s.tempDir, data, size)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	defer done()
+	defer src.Close()
 
 	if size < 0 {
 		size = readSize
@@ -884,7 +980,7 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *Put
 		return ObjectInfo{}, sqliteToMinioError(err)
 	}
 
-	_, err = io.CopyBuffer(blob, src, s.copyBuffer)
+	_, err = src.WriteTo(blob)
 	blob.Close()
 	if err != nil {
 		return ObjectInfo{}, err
@@ -1208,11 +1304,11 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 
 	size := data.Size()
 
-	src, readSize, done, err := s.readToTemp(data, size)
+	src, readSize, err := newTempBuffer(s.tempDir, data, size)
 	if err != nil {
 		return PartInfo{}, err
 	}
-	defer done()
+	defer src.Close()
 
 	if size < 0 {
 		size = readSize
@@ -1264,9 +1360,9 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 	if err != nil {
 		return PartInfo{}, sqliteToMinioError(err)
 	}
-	defer blob.Close()
 
-	_, err = io.CopyBuffer(blob, src, s.copyBuffer)
+	_, err = src.WriteTo(blob)
+	blob.Close()
 	if err != nil {
 		return PartInfo{}, err
 	}

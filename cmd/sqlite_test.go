@@ -1,8 +1,12 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"io/ioutil"
 	"net/url"
+	"os"
 	"reflect"
 	"runtime"
 	"strings"
@@ -11,6 +15,7 @@ import (
 
 	"crawshaw.io/sqlite"
 	"crawshaw.io/sqlite/sqlitex"
+	"github.com/minio/minio/pkg/hash"
 )
 
 func TestSQLiteLayer(t *testing.T) {
@@ -186,4 +191,108 @@ func testCheckErr(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestTempBuffer(t *testing.T) {
+	tempDir, done := testTempDir(t)
+	defer done()
+
+	tests := []struct {
+		desc           string
+		data           []byte
+		size           int64 // -2 = use len(data)
+		expectOverflow bool
+	}{
+		{
+			desc: "buffer_only_small",
+			data: bytes.Repeat([]byte("a"), 10),
+			size: -2,
+		},
+		{
+			desc: "buffer_only_sqliteTempFileThreshold",
+			data: bytes.Repeat([]byte("a"), sqliteTempFileThreshold),
+			size: -2,
+		},
+		{
+			desc:           "overflow_readSizeV1",
+			data:           bytes.Repeat([]byte("a"), readSizeV1+1),
+			size:           -1,
+			expectOverflow: true,
+		},
+		{
+			desc:           "overflow_sqliteTempFileThreshold",
+			data:           bytes.Repeat([]byte("a"), sqliteTempFileThreshold+1),
+			size:           -2,
+			expectOverflow: true,
+		},
+		{
+			desc: "zero",
+			data: nil,
+			size: -2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			size := tt.size
+			if size == -2 {
+				size = int64(len(tt.data))
+			}
+
+			hr, err := hash.NewReader(bytes.NewReader(tt.data), size, "", "", size)
+			if err != nil {
+				t.Fatal(err)
+			}
+			por := NewPutObjReader(hr, nil, nil)
+
+			tb, _, err := newTempBuffer(tempDir, por, size)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if (tb != nil && tb.f != nil) != tt.expectOverflow {
+				t.Errorf("expected overflow %t, got %t", tt.expectOverflow, tb.f != nil)
+			}
+
+			var buf bytes.Buffer
+			_, err = tb.WriteTo(&buf)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !bytes.Equal(tt.data, buf.Bytes()) {
+				t.Errorf("expected %s to be written, got %s",
+					testFormatBytes(tt.data),
+					testFormatBytes(buf.Bytes()),
+				)
+			}
+		})
+	}
+}
+
+func testFormatBytes(b []byte) string {
+	const display = 10
+
+	if len(b) <= display*2 {
+		return string(b)
+	}
+	return fmt.Sprintf("%q...(%d total bytes)...%q",
+		b[:display], len(b), b[len(b)-display:],
+	)
+}
+
+func testTempDir(t *testing.T) (tempDir string, done func()) {
+	tempDir, err := ioutil.TempDir("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done = func() {
+		err := os.RemoveAll(tempDir)
+		if err != nil {
+			t.Errorf("Unable to remove temp directory: %q", tempDir)
+		}
+	}
+
+	return tempDir, done
 }
