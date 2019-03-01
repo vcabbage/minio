@@ -29,7 +29,7 @@ import (
 const (
 	sqliteBufferSize        = 16 * 1024 * 1024
 	sqliteTempFileThreshold = 16 * 1024 * 1024
-	sqliteReadPoolSize      = 10 // TODO: what size?
+	sqliteReadPoolSize      = 100 // TODO: what size?
 )
 
 // Multipart uploads are maintained as individual parts to avoid
@@ -119,7 +119,13 @@ func NewSQLiteLayer(uri *url.URL) (ObjectLayer, error) {
 		uri.Scheme = "file"
 	}
 	file := uri.String()
-	conn, err := sqlite.OpenConn(file, 0)
+
+	const (
+		flags   = sqlite.SQLITE_OPEN_WAL | sqlite.SQLITE_OPEN_URI | sqlite.SQLITE_OPEN_NOMUTEX
+		rwFlags = sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE | flags
+		roFlags = sqlite.SQLITE_OPEN_READONLY | flags
+	)
+	conn, err := sqlite.OpenConn(file, rwFlags)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +138,6 @@ func NewSQLiteLayer(uri *url.URL) (ObjectLayer, error) {
 	}
 
 	// Create read pool
-	const roFlags = sqlite.SQLITE_OPEN_READONLY | sqlite.SQLITE_OPEN_URI | sqlite.SQLITE_OPEN_NOMUTEX
 	pool, err := sqlitex.Open(file, roFlags, sqliteReadPoolSize)
 	if err != nil {
 		return nil, err
@@ -281,15 +286,28 @@ func (s *SQLite) getConn(ctx context.Context) (*sqlite.Conn, error) {
 	return conn, nil
 }
 
+func (s *SQLite) writerAcquire(ctx context.Context) {
+	s.mu.Lock()
+	s.writer.SetInterrupt(ctx.Done())
+}
+
+func (s *SQLite) writerRelease() {
+	query := s.writer.CheckReset()
+	if query != "" {
+		panic("writer released with active statement: \"" + query + "\"")
+	}
+	s.writer.SetInterrupt(nil)
+	s.mu.Unlock()
+}
+
 // Bucket operations.
 func (s *SQLite) MakeBucketWithLocation(ctx context.Context, bucket string, location string) error {
 	if !IsValidBucketName(bucket) {
 		return BucketNameInvalid{Bucket: bucket}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writer.SetInterrupt(ctx.Done())
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
 
 	err := bucketExists(s.writer, bucket)
 	if err == nil {
@@ -357,9 +375,8 @@ func (s *SQLite) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 }
 
 func (s *SQLite) DeleteBucket(ctx context.Context, bucket string) (err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writer.SetInterrupt(ctx.Done())
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
 
 	stmt := s.writer.Prep("DELETE FROM buckets WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
@@ -392,6 +409,21 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 	}
 	defer s.readers.Put(conn)
 
+	// Query logic is relatively simply when no delimiter is specified.
+	// * 'INSTR(object, prefix) = 1' - filters to objects with the specified prefix.
+	// * 'object > marker'           - SQLite defaults to binary ordering for TEXT
+	//
+	// Significantly more logic is required to handle delimiters. The union of two
+	// selects are used to get the desired results. The first query finds all prefixes
+	// and the second finds objects.
+	// * 'SUBSTR(object, 1, LENGTH($prefix) + INSTR(SUBSTR(object, LENGTH($prefix)+1), $delimiter))'
+	//   - This inscrutable bit effectively trims the prefix from the object name,
+	//     finds the index of first occurrence of the delimiter in the result,
+	//     then trims the original object name down to that index + the length of the prefix,
+	//     resulting in the object name up to the first instance of delimiter after the prefix.
+	// * 'INSTR(SUBSTR(object, LENGTH($prefix)+1), $delimiter)' -
+	//   - Evaluates to 0 if the delimiter does not exist after the prefix and a value
+	//     greater than 0 if it does.
 	var stmt *sqlite.Stmt
 	if delimiter == "" {
 		stmt = conn.Prep(`
@@ -960,9 +992,8 @@ func (s *SQLite) PutObject(ctx context.Context, bucket, object string, data *Put
 	contentType := mimedb.TypeByExtension(path.Ext(object))
 	actualSize := data.ActualSize()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writer.SetInterrupt(ctx.Done())
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
 
 	defer sqlitex.Save(s.writer)(&err)
 
@@ -1024,9 +1055,8 @@ func (s *SQLite) CopyObject(ctx context.Context, srcBucket, srcObject, destBucke
 		return ObjectInfo{}, err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writer.SetInterrupt(ctx.Done())
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
 
 	err = bucketExists(s.writer, srcBucket)
 	if err != nil {
@@ -1084,9 +1114,8 @@ func (s *SQLite) CopyObject(ctx context.Context, srcBucket, srcObject, destBucke
 }
 
 func (s *SQLite) DeleteObject(ctx context.Context, bucket, object string) (err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writer.SetInterrupt(ctx.Done())
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
 
 	err = bucketExists(s.writer, bucket)
 	if err != nil {
@@ -1233,9 +1262,8 @@ func (s *SQLite) NewMultipartUpload(ctx context.Context, bucket, object string, 
 		return "", err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writer.SetInterrupt(ctx.Done())
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
 
 	defer sqlitex.Save(s.writer)(&err)
 
@@ -1317,9 +1345,8 @@ func (s *SQLite) PutObjectPart(ctx context.Context, bucket, object, uploadID str
 	etag := data.MD5CurrentHexString()
 	actualSize := data.ActualSize()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writer.SetInterrupt(ctx.Done())
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
 
 	defer sqlitex.Save(s.writer)(&err)
 
@@ -1442,9 +1469,8 @@ func (s *SQLite) AbortMultipartUpload(ctx context.Context, bucket, object, uploa
 		return err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writer.SetInterrupt(ctx.Done())
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
 
 	stmt := s.writer.Prep("DELETE FROM uploads WHERE id = ?;")
 	stmt.BindText(1, uploadID)
@@ -1472,9 +1498,8 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 		return ObjectInfo{}, err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writer.SetInterrupt(ctx.Done())
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
 
 	defer sqlitex.Save(s.writer)(&err)
 
@@ -1610,9 +1635,8 @@ func (s *SQLite) SetBucketPolicy(ctx context.Context, bucket string, policy *pol
 		return err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writer.SetInterrupt(ctx.Done())
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
 
 	stmt := s.writer.Prep("UPDATE buckets SET policy = ? WHERE bucket = ?;")
 	stmt.BindBytes(1, policyJSON)
@@ -1655,9 +1679,8 @@ func (s *SQLite) GetBucketPolicy(ctx context.Context, bucket string) (*policy.Po
 }
 
 func (s *SQLite) DeleteBucketPolicy(ctx context.Context, bucket string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.writer.SetInterrupt(ctx.Done())
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
 
 	stmt := s.writer.Prep("UPDATE buckets SET policy = NULL WHERE bucket = ?;")
 	stmt.BindText(1, bucket)
@@ -1739,7 +1762,7 @@ func sqliteExecResults(stmt *sqlite.Stmt, fn func() error) (int, error) {
 	}
 }
 
-func newBlobReader(bucket, object string, blobs []*sqlite.Blob, startOffset, length int64) (io.Reader, error) {
+func newBlobReader(bucket, object string, blobs []*sqlite.Blob, startOffset, length int64) (*multiBlobReader, error) {
 	if len(blobs) == 0 {
 		return nil, ObjectNotFound{Bucket: bucket, Object: object}
 	}
