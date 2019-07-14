@@ -239,7 +239,7 @@ func TestTempBuffer(t *testing.T) {
 				size = int64(len(tt.data))
 			}
 
-			hr, err := hash.NewReader(bytes.NewReader(tt.data), size, "", "", size)
+			hr, err := hash.NewReader(bytes.NewReader(tt.data), size, "", "", size, globalCLIContext.StrictS3Compat)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -5,6 +5,7 @@ go 1.12
 require (
 	cloud.google.com/go v0.37.2
 	contrib.go.opencensus.io/exporter/ocagent v0.5.0 // indirect
+	crawshaw.io/sqlite v0.1.3-0.20190520153332-66f853b01dfb
 	github.com/Azure/azure-sdk-for-go v27.0.0+incompatible
 	github.com/Azure/go-autorest v11.7.0+incompatible
 	github.com/DataDog/zstd v1.4.0 // indirect

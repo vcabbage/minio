@@ -462,7 +462,9 @@ func (s *SQLite) ListObjects(ctx context.Context, bucket, prefix, marker, delimi
 		)
 		SELECT object, size, modified, etag, metadata, 0 as is_prefix FROM result_objects
 		UNION ALL
-		SELECT object, 0 as size, 0 as modified, '' as etag, NULL as metadata, 1 as is_prefix FROM result_prefixes
+			SELECT object, 0 as size, 0 as modified, '' as etag, NULL as metadata, 1 as is_prefix
+			FROM result_prefixes
+			WHERE object > $marker
 		ORDER BY object
 		LIMIT $max_keys;`)
 		stmt.SetText("$bucket", bucket)
@@ -580,7 +582,7 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 			Name:   object,
 			IsDir:  true,
 		}
-		return NewGetObjectReaderFromReader(bytes.NewReader(nil), info), nil
+		return NewGetObjectReaderFromReader(bytes.NewReader(nil), info, opts.CheckCopyPrecondFn)
 	}
 
 	stmt := conn.Prep(`
@@ -619,7 +621,7 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		}
 	}
 
-	objReaderFn, startOffset, length, err := NewGetObjectReader(rs, oi)
+	objReaderFn, startOffset, length, err := NewGetObjectReader(rs, oi, opts.CheckCopyPrecondFn)
 	if err != nil {
 		return nil, err
 	}
@@ -663,7 +665,7 @@ func (s *SQLite) GetObjectNInfo(ctx context.Context, bucket, object string, rs *
 		}
 		s.readers.Put(conn)
 	}
-	return objReaderFn(rdr, h, closer)
+	return objReaderFn(rdr, h, opts.CheckCopyPrecondFn, closer)
 }
 
 func (s *SQLite) GetObject(ctx context.Context, bucket, object string, startOffset, length int64, writer io.Writer, etag string, opts ObjectOptions) error {
@@ -833,7 +835,7 @@ type tempBuffer struct {
 func newTempBuffer(tempDir string, src *PutObjReader, size int64) (*tempBuffer, int64, error) {
 	// TODO: document this behavior
 	if size == 0 {
-		return nil, 0, nil
+		return nil, 0, src.Verify()
 	}
 
 	bufSize := readSizeV1
@@ -1138,6 +1140,37 @@ func (s *SQLite) DeleteObject(ctx context.Context, bucket, object string) (err e
 	}
 
 	return nil
+}
+
+func (s *SQLite) DeleteObjects(ctx context.Context, bucket string, objects []string) ([]error, error) {
+	errs := make([]error, len(objects))
+
+	s.writerAcquire(ctx)
+	defer s.writerRelease()
+
+	err := bucketExists(s.writer, bucket)
+	if err != nil {
+		return errs, err
+	}
+
+	for idx, object := range objects {
+		stmt := s.writer.Prep("DELETE FROM objects WHERE bucket = ? AND object = ?;")
+		stmt.BindText(1, bucket)
+		stmt.BindText(2, object)
+		err = sqliteExec(stmt)
+		if err != nil {
+			errs[idx] = err
+		}
+
+		if s.writer.Changes() == 0 {
+			errs[idx] = ObjectNotFound{
+				Bucket: bucket,
+				Object: object,
+			}
+		}
+	}
+
+	return errs, nil
 }
 
 func (s *SQLite) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (_ ListMultipartsInfo, err error) {
@@ -1493,10 +1526,7 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	}
 
 	contentType := mimedb.TypeByExtension(path.Ext(object))
-	etag, err := getCompleteMultipartMD5(ctx, uploadedParts)
-	if err != nil {
-		return ObjectInfo{}, err
-	}
+	etag := getCompleteMultipartMD5(uploadedParts)
 
 	s.writerAcquire(ctx)
 	defer s.writerRelease()
@@ -1540,8 +1570,15 @@ func (s *SQLite) CompleteMultipartUpload(ctx context.Context, bucket, object, up
 	)
 	for i, part := range uploadedParts {
 		dbPart, ok := dbPartIDs[part.PartNumber]
-		if !ok || part.ETag != dbPart.etag {
+		if !ok {
 			return ObjectInfo{}, InvalidPart{PartNumber: part.PartNumber}
+		}
+		if canonicalizeETag(part.ETag) != dbPart.etag {
+			return ObjectInfo{}, InvalidPart{
+				PartNumber: part.PartNumber,
+				ExpETag:    dbPart.etag,
+				GotETag:    part.ETag,
+			}
 		}
 		if !isMinAllowedPartSize(dbPart.actualSize) && i != lastPart {
 			return ObjectInfo{}, PartTooSmall{
@@ -1618,8 +1655,11 @@ func (s *SQLite) HealFormat(ctx context.Context, dryRun bool) (madmin.HealResult
 func (s *SQLite) HealBucket(ctx context.Context, bucket string, dryRun, remove bool) (madmin.HealResultItem, error) {
 	return madmin.HealResultItem{}, NotImplemented{}
 }
-func (s *SQLite) HealObject(ctx context.Context, bucket, object string, dryRun bool, remove bool) (madmin.HealResultItem, error) {
+func (s *SQLite) HealObject(ctx context.Context, bucket, object string, dryRun bool, remove bool, scanMode madmin.HealScanMode) (madmin.HealResultItem, error) {
 	return madmin.HealResultItem{}, NotImplemented{}
+}
+func (s *SQLite) HealObjects(ctx context.Context, bucket, prefix string, healObjectFn func(string, string) error) error {
+	return NotImplemented{}
 }
 func (s *SQLite) ListBucketsHeal(ctx context.Context) ([]BucketInfo, error) {
 	return nil, NotImplemented{}

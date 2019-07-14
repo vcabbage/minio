@@ -147,6 +147,10 @@ func (l *DebugLayer) DeleteObject(ctx context.Context, bucket, object string) (e
 	defer l.tracef("DeleteObject(%v, %q, %q)\n", ctx, bucket, object)(&err)
 	return l.Wrapped.DeleteObject(ctx, bucket, object)
 }
+func (l *DebugLayer) DeleteObjects(ctx context.Context, bucket string, objects []string) (errs []error, err error) {
+	defer l.tracef("DeleteObjects(%v, %q, %q)\n", ctx, bucket, objects)(&errs, &err)
+	return l.Wrapped.DeleteObjects(ctx, bucket, objects)
+}
 
 // Multipart operations.
 func (l *DebugLayer) ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (res ListMultipartsInfo, err error) {
@@ -191,9 +195,13 @@ func (l *DebugLayer) HealBucket(ctx context.Context, bucket string, dryRun, remo
 	defer l.tracef("HealBucket(%v, %q, %t, %t)\n", ctx, bucket, dryRun, remove)(&res, &err)
 	return l.Wrapped.HealBucket(ctx, bucket, dryRun, remove)
 }
-func (l *DebugLayer) HealObject(ctx context.Context, bucket, object string, dryRun, remove bool) (res madmin.HealResultItem, err error) {
-	defer l.tracef("HealObject(%v, %q, %q, %t, %t)\n", ctx, bucket, object, dryRun, remove)(&res, &err)
-	return l.Wrapped.HealObject(ctx, bucket, object, dryRun, remove)
+func (l *DebugLayer) HealObject(ctx context.Context, bucket, object string, dryRun, remove bool, mode madmin.HealScanMode) (res madmin.HealResultItem, err error) {
+	defer l.tracef("HealObject(%v, %q, %q, %t, %t, %v)\n", ctx, bucket, object, dryRun, remove, mode)(&res, &err)
+	return l.Wrapped.HealObject(ctx, bucket, object, dryRun, remove, mode)
+}
+func (l *DebugLayer) HealObjects(ctx context.Context, bucket, prefix string, healObjectFn func(string, string) error) (err error) {
+	defer l.tracef("HealObjects(%v, %q, %q, %p)\n", ctx, bucket, prefix, healObjectFn)(&err)
+	return l.Wrapped.HealObjects(ctx, bucket, prefix, healObjectFn)
 }
 func (l *DebugLayer) ListBucketsHeal(ctx context.Context) (res []BucketInfo, err error) {
 	defer l.tracef("ListBucketsHeal(%v)\n", ctx)(&res, &err)
